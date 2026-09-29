@@ -54,7 +54,39 @@ It takes about a minute.
 | Explain | `src/explain.py` | SHAP charts, comparison with the hidden rule, two example orders. `reports/figures/`, `reports/demo_orders.json` |
 | Demo | `src/build_demo.py` | `demo/index.html`, one offline file. Open it in a browser; add `#B` to the URL to start on Order B |
 
+| App data | `src/export_app.py` | `app_data/model_params.json` (the Logistic Regression as plain numbers) and `app_data/orders.csv` (all 76,232 scored orders + the raw counts behind each feature). Checks that the app rebuilds every feature and score exactly |
+
 Shared model helpers (feature list + leakage assert, calibration, readable names) are in `src/modeling.py`.
+
+## Interactive app (Streamlit)
+
+The Streamlit app at the repo root (`app.py`) has a **System** switch in the sidebar:
+the original "COD Trust Score (Scorecard + LLM)" and this project's **"COD Risk Score (ML model)"**
+(code in `risk_ui/`). From the repo root:
+
+```bash
+python -m venv .venv
+.venv/Scripts/activate            # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt   # the root requirements (streamlit, plotly, ...)
+streamlit run app.py
+```
+
+Open http://localhost:8501/?system=ml to go straight to the ML pages
+(add `&page=orders`, `&page=score` or `&page=simulator`). Pages:
+
+| Page | What it does |
+| --- | --- |
+| Dashboard | KPIs, risk distribution with cut-offs, tier table, failure types per tier, capture curve, calibration, breakdown by 14 segments, areas + fairness check, weekly trend |
+| Orders | All 76,232 orders (sortable, downloadable). Click a row: score, tier, top 3 reasons, every factor's push, phone mockup, and the simulation truth |
+| Score an order | Type raw checkout data (history counts, value, time, area ...); the app builds the 20 features and scores live. "Load into form" copies any existing order |
+| Policy simulator | Move tier cut-offs, catch rates, friction and message cost; see tier shape, the three policies, net value vs cut-off and a sensitivity table |
+
+Every filter in the sidebar (date, split, month, value, hour, history, refusals, account age, area,
+risk, tier, actual outcome, order / buyer ID ...) applies to Dashboard, Orders and (optionally) the simulator,
+and is kept when you switch pages. Feb-Jun orders were used for training, so filter **Split = test** for honest numbers.
+
+The app does not load the joblib models (both projects have a package called `src`); it uses the exported
+numbers, and `src/export_app.py` proves they give the same scores.
 Tier cut-offs and money assumptions are under `decision:` in `config.yaml`.
 
 ## Data steps in detail

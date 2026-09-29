@@ -14,4 +14,5 @@ set PYTHONIOENCODING=utf-8
 %PY% -m src.decide || exit /b 1
 %PY% -m src.explain || exit /b 1
 %PY% -m src.build_demo || exit /b 1
+%PY% -m src.export_app || exit /b 1
 %PY% -m src.summary || exit /b 1

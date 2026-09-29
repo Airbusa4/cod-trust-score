@@ -18,4 +18,5 @@ $PY -m src.evaluate
 $PY -m src.decide
 $PY -m src.explain
 $PY -m src.build_demo
+$PY -m src.export_app
 $PY -m src.summary

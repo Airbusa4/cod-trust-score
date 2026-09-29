@@ -25,6 +25,16 @@ try:
 except Exception:
     pass
 
+# Two systems in one app: the original Scorecard + LLM, and the ML COD Risk Score
+# (cod_risk_demo/ pipeline; pages live in risk_ui/).
+system = st.sidebar.radio("System", ["COD Trust Score (Scorecard + LLM)", "COD Risk Score (ML model)"],
+                          index=1 if st.query_params.get("system") == "ml" else 0, key="system")
+if system == "COD Risk Score (ML model)":
+    from risk_ui.app import render
+
+    render()
+    st.stop()
+
 
 @st.cache_data
 def load_scored() -> pd.DataFrame:

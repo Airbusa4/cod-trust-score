@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>COD Risk Score demo</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #1d2330; --muted: #5d6677; --line: #e3e6ec;
+    --brand: #ee4d2d; --green: #1e8e3e; --amber: #c77700; --red: #d93025;
+    --green-bg: #e6f4ea; --amber-bg: #fff4e0; --red-bg: #fce8e6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font-family: "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif; font-size: 20px; }
+  .wrap { max-width: 1760px; margin: 0 auto; padding: 32px 40px 24px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+  h1 { font-size: 38px; margin: 0; letter-spacing: -0.5px; }
+  h1 span { color: var(--brand); }
+  .pick { display: flex; gap: 16px; }
+  .pick button { font-size: 24px; font-weight: 600; padding: 16px 36px; border-radius: 14px; cursor: pointer;
+                 border: 3px solid var(--ink); background: var(--card); color: var(--ink); }
+  .pick button.on { background: var(--ink); color: #fff; }
+  .grid { display: grid; grid-template-columns: 1fr 440px; gap: 32px; margin-top: 28px; align-items: start; }
+  .card { background: var(--card); border-radius: 20px; padding: 28px 32px; box-shadow: 0 2px 10px rgba(20,30,50,.06); }
+  .card h2 { font-size: 22px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 0 0 16px; }
+  .top { display: grid; grid-template-columns: 1.1fr 1fr; gap: 28px; }
+  .facts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; }
+  .fact { border-bottom: 1px solid var(--line); padding: 8px 0; }
+  .fact .k { font-size: 16px; color: var(--muted); }
+  .fact .v { font-size: 26px; font-weight: 650; }
+  .score { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; }
+  .risk { font-size: 96px; font-weight: 800; line-height: 1; letter-spacing: -2px; }
+  .risk small { display: block; font-size: 20px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-top: 8px; }
+  .badge { font-size: 28px; font-weight: 750; padding: 10px 24px; border-radius: 999px; }
+  .t0 { background: var(--green-bg); color: var(--green); }
+  .t1 { background: var(--amber-bg); color: var(--amber); }
+  .t2 { background: var(--red-bg); color: var(--red); }
+  .action { font-size: 24px; font-weight: 600; }
+  .action b { color: var(--muted); font-weight: 500; }
+  .reasons { margin-top: 28px; }
+  .reason { display: grid; grid-template-columns: 56px 1fr 260px; align-items: center; gap: 16px; padding: 14px 0;
+            border-bottom: 1px solid var(--line); }
+  .reason:last-child { border-bottom: 0; }
+  .arrow { font-size: 34px; font-weight: 800; text-align: center; }
+  .up { color: var(--red); } .down { color: var(--green); }
+  .rtext { font-size: 26px; font-weight: 600; }
+  .rtext small { display: block; font-size: 17px; color: var(--muted); font-weight: 500; }
+  .bar { height: 18px; border-radius: 9px; background: var(--line); position: relative; overflow: hidden; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 9px; }
+  .bar i.up { background: var(--red); } .bar i.down { background: var(--green); }
+  /* phone */
+  .phone { width: 420px; height: 820px; border-radius: 52px; background: #111; padding: 16px; margin: 0 auto;
+           box-shadow: 0 20px 40px rgba(0,0,0,.18); }
+  .screen { background: #fff; border-radius: 40px; height: 100%; overflow: hidden; display: flex; flex-direction: column; }
+  .notch { height: 34px; display: flex; justify-content: center; align-items: center; }
+  .notch i { width: 120px; height: 22px; background: #111; border-radius: 12px; }
+  .appbar { background: var(--brand); color: #fff; font-size: 22px; font-weight: 700; padding: 16px 22px; }
+  .pbody { padding: 22px; display: flex; flex-direction: column; gap: 14px; flex: 1; }
+  .ptitle { font-size: 28px; font-weight: 750; line-height: 1.2; }
+  .psub { font-size: 18px; color: var(--muted); line-height: 1.35; }
+  .check { width: 84px; height: 84px; border-radius: 50%; background: var(--green-bg); color: var(--green);
+           font-size: 48px; display: flex; align-items: center; justify-content: center; margin: 24px auto 4px; }
+  .pbtn { font-size: 21px; font-weight: 650; padding: 15px; border-radius: 12px; text-align: center; border: 2px solid var(--line); }
+  .pbtn.main { background: var(--brand); color: #fff; border-color: var(--brand); }
+  .pbtn.alt { color: var(--ink); }
+  .pbtn.offer { background: var(--amber-bg); border-color: #f3d19c; color: #7a4a00; text-align: left; }
+  .pbtn.offer small { display: block; font-size: 15px; font-weight: 500; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .phone-cap { text-align: center; color: var(--muted); font-size: 17px; margin-top: 14px; }
+  footer { margin-top: 26px; text-align: center; color: var(--muted); font-size: 18px; }
+  @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } .top { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span>COD Risk Score</span> &middot; checkout demo</h1>
+    <div class="pick">
+      <button id="btnA" onclick="show('A')">Order A</button>
+      <button id="btnB" onclick="show('B')">Order B</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <div class="top">
+        <div>
+          <h2>Order facts</h2>
+          <div class="facts" id="facts"></div>
+        </div>
+        <div class="score">
+          <h2>Risk of failed delivery</h2>
+          <div class="risk" id="risk"></div>
+          <div class="badge" id="badge"></div>
+          <div class="action" id="action"></div>
+        </div>
+      </div>
+      <div class="reasons">
+        <h2>Top 3 reasons</h2>
+        <div id="reasons"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="phone"><div class="screen">
+        <div class="notch"><i></i></div>
+        <div class="appbar">Checkout</div>
+        <div class="pbody" id="phone"></div>
+      </div></div>
+      <div class="phone-cap">What the buyer sees</div>
+    </div>
+  </div>
+
+  <footer>Synthetic data, for illustration only. Not Shopee data. &middot; Model: <span id="model"></span></footer>
+</div>
+
+<script>
+const DATA = {"note": "Synthetic data, for illustration only. Not Shopee data.", "model": "Logistic Regression", "tier_cutoffs": {"tier1": 0.023, "tier2": 0.1}, "orders": {"A": {"label": "risky", "order_id": 25390, "order_datetime": "2026-07-02 04:44:54", "risk": 0.1567, "tier": 2, "action": "Confirm + choose prepaid, deposit or call", "facts": {"Order value": "฿3,694", "Value vs usual": "10.5x", "Order time": "04:44", "Account age": "67 days", "Past COD orders": "4", "Past refusals": "1", "Same item at other shops (48h)": "1", "Expected delivery": "2 days"}, "features": {"hist_cod_orders": 4, "hist_refusals": 1, "refusal_rate_smoothed": 0.09, "recent_refusal_rate_smoothed_90d": 0.09, "days_since_last_refusal": 46, "has_ever_refused": 1, "hist_buyer_caused_misses": 0, "hist_courier_caused_failures": 0, "order_value": 3694, "value_vs_aov": 10.5018, "freq_change_ratio": 0.5766, "account_age_days": 67, "is_new_cod_buyer": 0, "is_late_night": 1, "same_item_other_shops_48h": 1, "is_campaign_day": 0, "expected_days_to_delivery": 2, "area_logistics_failure_rate": 0.002494, "address_is_condo_with_office": 0, "order_month": 7}, "reasons": [{"feature": "same_item_other_shops_48h", "name": "Same item at other shops (48h)", "text": "Same item ordered with COD at 1 other shop in 48h", "shap": 0.879, "direction": "up"}, {"feature": "refusal_rate_smoothed", "name": "Refusal rate (smoothed)", "text": "Refused 1 of 4 past COD parcels", "shap": 0.649, "direction": "up"}, {"feature": "hist_cod_orders", "name": "Past COD orders", "text": "Only 4 past COD orders (little track record)", "shap": 0.203, "direction": "up"}]}, "B": {"label": "safe", "order_id": 164525, "order_datetime": "2026-07-06 20:11:43", "risk": 0.0048, "tier": 0, "action": "Nothing extra", "facts": {"Order value": "฿227", "Value vs usual": "0.8x", "Order time": "20:11", "Account age": "594 days", "Past COD orders": "81", "Past refusals": "0", "Same item at other shops (48h)": "0", "Expected delivery": "1 day"}, "features": {"hist_cod_orders": 81, "hist_refusals": 0, "refusal_rate_smoothed": 0.002857, "recent_refusal_rate_smoothed_90d": 0.01, "days_since_last_refusal": -1, "has_ever_refused": 0, "hist_buyer_caused_misses": 0, "hist_courier_caused_failures": 0, "order_value": 227, "value_vs_aov": 0.8144, "freq_change_ratio": 1.1026, "account_age_days": 594, "is_new_cod_buyer": 0, "is_late_night": 0, "same_item_other_shops_48h": 0, "is_campaign_day": 0, "expected_days_to_delivery": 1, "area_logistics_failure_rate": 0.000818, "address_is_condo_with_office": 1, "order_month": 7}, "reasons": [{"feature": "hist_cod_orders", "name": "Past COD orders", "text": "81 past COD orders (long track record)", "shap": -0.895, "direction": "down"}, {"feature": "refusal_rate_smoothed", "name": "Refusal rate (smoothed)", "text": "Refused 0 of 81 past COD parcels", "shap": -0.159, "direction": "down"}, {"feature": "expected_days_to_delivery", "name": "Expected delivery days", "text": "Delivery expected in 1 day", "shap": -0.118, "direction": "down"}]}}};
+const TIER_NAME = {0: "Tier 0 · Low risk", 1: "Tier 1 · Confirm", 2: "Tier 2 · High risk"};
+
+function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html !== undefined) e.innerHTML = html; return e; }
+
+function phone(o) {
+  const value = o.facts["Order value"];
+  if (o.tier === 0) {
+    return `<div class="check">&#10003;</div>
+      <div class="ptitle" style="text-align:center">Order placed</div>
+      <div class="psub" style="text-align:center">${value} &middot; Cash on delivery.<br>Pay the courier when your parcel arrives.</div>`;
+  }
+  let html = `<div class="ptitle">Ready to ship ${value} COD</div>
+    <div class="psub">Please confirm you will be home to receive and pay for this parcel.</div>
+    <div class="pbtn main">Confirm</div>
+    <div class="row2"><div class="pbtn alt">Cancel</div><div class="pbtn alt">Pay now</div></div>`;
+  if (o.tier === 2) {
+    html += `<div class="pbtn offer">Pay now and get &#3647;10 coins<small>Faster delivery, no cash needed</small></div>
+      <div class="pbtn offer">Keep COD with &#3647;20 deposit<small>Deposit is returned on delivery</small></div>`;
+  }
+  return html;
+}
+
+function show(key) {
+  const o = DATA.orders[key];
+  document.getElementById("btnA").classList.toggle("on", key === "A");
+  document.getElementById("btnB").classList.toggle("on", key === "B");
+
+  const facts = document.getElementById("facts"); facts.innerHTML = "";
+  for (const [k, v] of Object.entries(o.facts)) {
+    const f = el("div", "fact"); f.append(el("div", "k", k), el("div", "v", v)); facts.append(f);
+  }
+  const risk = document.getElementById("risk");
+  risk.innerHTML = `${(o.risk * 100).toFixed(1)}%<small>chance this COD parcel fails (average is about 2.6%)</small>`;
+  risk.style.color = ["var(--green)", "var(--amber)", "var(--red)"][o.tier];
+  const badge = document.getElementById("badge");
+  badge.className = "badge t" + o.tier; badge.textContent = TIER_NAME[o.tier];
+  document.getElementById("action").innerHTML = `<b>Action:</b> ${o.action}`;
+
+  const maxAbs = Math.max(...o.reasons.map(r => Math.abs(r.shap)));
+  const box = document.getElementById("reasons"); box.innerHTML = "";
+  for (const r of o.reasons) {
+    const row = el("div", "reason");
+    row.append(el("div", "arrow " + r.direction, r.direction === "up" ? "&#9650;" : "&#9660;"));
+    row.append(el("div", "rtext", `${r.text}<small>${r.direction === "up" ? "Pushes risk up" : "Pushes risk down"} (${r.name})</small>`));
+    const bar = el("div", "bar"); const fill = el("i", r.direction);
+    fill.style.width = (100 * Math.abs(r.shap) / maxAbs).toFixed(0) + "%"; bar.append(fill); row.append(bar);
+    box.append(row);
+  }
+  document.getElementById("phone").innerHTML = phone(o);
+}
+
+document.getElementById("model").textContent = DATA.model;
+show(location.hash === "#B" ? "B" : "A");
+</script>
+</body>
+</html>

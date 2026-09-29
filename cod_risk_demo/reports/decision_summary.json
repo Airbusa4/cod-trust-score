@@ -1,0 +1,44 @@
+{
+  "note": "Synthetic data, for illustration only. Not Shopee data.",
+  "model": "Logistic Regression",
+  "tiers": [
+    {
+      "tier": 0,
+      "orders": 8880,
+      "order_share": 0.546,
+      "failure_share": 0.2707,
+      "failure_rate": 0.0136,
+      "mean_predicted": 0.0165,
+      "wont_share_of_failures": 0.3967
+    },
+    {
+      "tier": 1,
+      "orders": 7000,
+      "order_share": 0.4304,
+      "failure_share": 0.5011,
+      "failure_rate": 0.032,
+      "mean_predicted": 0.0324,
+      "wont_share_of_failures": 0.6786
+    },
+    {
+      "tier": 2,
+      "orders": 383,
+      "order_share": 0.0236,
+      "failure_share": 0.2282,
+      "failure_rate": 0.2663,
+      "mean_predicted": 0.2605,
+      "wont_share_of_failures": 0.951
+    }
+  ],
+  "net_per_year_thb": {
+    "Do nothing": 0,
+    "Ask everyone": 8723813,
+    "Our tiers": 36295272
+  },
+  "net_per_1000_thb": {
+    "Do nothing": 0.0,
+    "Ask everyone": 61.15,
+    "Our tiers": 254.42
+  },
+  "sensitivity_wins": "9/9"
+}

@@ -1,0 +1,7 @@
+{
+  "model": "logreg",
+  "file": "logreg.joblib",
+  "name": "Logistic Regression",
+  "auc_gap_lgbm_minus_logreg": -0.0231,
+  "reason": "LightGBM's AUC gap over Logistic Regression is -0.023 (under 0.01). It does not clearly win, so the simpler, easier-to-explain Logistic Regression is recommended."
+}

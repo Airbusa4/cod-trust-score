@@ -1,0 +1,22 @@
+[
+  "hist_cod_orders",
+  "hist_refusals",
+  "refusal_rate_smoothed",
+  "recent_refusal_rate_smoothed_90d",
+  "days_since_last_refusal",
+  "has_ever_refused",
+  "hist_buyer_caused_misses",
+  "hist_courier_caused_failures",
+  "order_value",
+  "value_vs_aov",
+  "freq_change_ratio",
+  "account_age_days",
+  "is_new_cod_buyer",
+  "is_late_night",
+  "same_item_other_shops_48h",
+  "is_campaign_day",
+  "expected_days_to_delivery",
+  "area_logistics_failure_rate",
+  "address_is_condo_with_office",
+  "order_month"
+]

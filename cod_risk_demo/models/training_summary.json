@@ -1,0 +1,77 @@
+{
+  "note": "Synthetic data, for illustration only. Not Shopee data.",
+  "fit_rows": 47975,
+  "valid_rows": 11994,
+  "valid_from": "2026-06-04 22:16:02",
+  "calibration_method": "platt",
+  "logreg_valid_auc": 0.7146,
+  "lgbm_trials": [
+    {
+      "change": "base",
+      "params": {
+        "n_estimators": 500,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "min_child_samples": 100,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8
+      },
+      "best_iteration": 94,
+      "valid_auc": 0.7037
+    },
+    {
+      "change": {
+        "num_leaves": 15
+      },
+      "params": {
+        "n_estimators": 500,
+        "learning_rate": 0.03,
+        "num_leaves": 15,
+        "min_child_samples": 100,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8
+      },
+      "best_iteration": 185,
+      "valid_auc": 0.7106
+    },
+    {
+      "change": {
+        "min_child_samples": 300
+      },
+      "params": {
+        "n_estimators": 500,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "min_child_samples": 300,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8
+      },
+      "best_iteration": 108,
+      "valid_auc": 0.7048
+    },
+    {
+      "change": {
+        "num_leaves": 15,
+        "min_child_samples": 300,
+        "learning_rate": 0.02
+      },
+      "params": {
+        "n_estimators": 500,
+        "learning_rate": 0.02,
+        "num_leaves": 15,
+        "min_child_samples": 300,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8
+      },
+      "best_iteration": 193,
+      "valid_auc": 0.7095
+    }
+  ],
+  "lgbm_picked": {
+    "num_leaves": 15
+  }
+}

@@ -1,0 +1,224 @@
+# SYNTHETIC DATA - for illustration only. This is NOT real Shopee data.
+# Every number used by the COD Risk Score demo generator lives in this file.
+
+seed: 42
+
+# ---------------------------------------------------------------------------
+# Time windows
+# ---------------------------------------------------------------------------
+dates:
+  sim_start: "2025-02-01"     # first day of the simulation (history only)
+  model_start: "2026-02-01"   # orders from here on become model rows
+  test_start: "2026-07-01"    # train = model_start .. test_start, test = July 2026
+  sim_end: "2026-07-31"       # last day of the simulation (inclusive)
+
+# ---------------------------------------------------------------------------
+# Areas (courier network, NOT buyer behaviour)
+# ---------------------------------------------------------------------------
+areas:
+  n_areas: 60
+  # Hidden courier failure rate per area. Each group: share of areas, rate range.
+  logistics_rate_groups:
+    - {share: 0.85, low: 0.0010, high: 0.0020}   # normal areas
+    - {share: 0.10, low: 0.0020, high: 0.0035}   # slightly weak areas
+    - {share: 0.05, low: 0.0150, high: 0.0200}   # a few poor areas (3 of 60)
+  # Base delivery days for an area; each order adds 0..2 random days, capped at 6.
+  base_delivery_days: [1, 2, 3, 4]
+  base_delivery_days_probs: [0.35, 0.35, 0.20, 0.10]
+  extra_delivery_days_max: 2
+  max_delivery_days: 6
+
+# ---------------------------------------------------------------------------
+# Buyers
+# ---------------------------------------------------------------------------
+buyers:
+  n_buyers: 30000
+  # When buyers sign up. Many join late, so many COD orders have little history.
+  signup_before_sim_from: "2022-01-01"
+  signup_period_shares:
+    before_sim: 0.20     # signed up before Feb 2025
+    history_window: 0.15 # signed up Feb 2025 - Jan 2026
+    model_window: 0.65   # signed up Feb 2026 - Jul 2026
+  condo_with_office_share: 0.25
+
+  # Ordering habit. "regular" = 2-4 COD orders a month, "occasional" = a few a year.
+  # Buyers who only just joined are mostly still trying COD once or twice.
+  regular_share_by_period:
+    before_sim: 0.35
+    history_window: 0.30
+    model_window: 0.08
+  regular_monthly_rate: [2.0, 4.0]          # uniform range
+  occasional_monthly_rate_median: 0.15      # lognormal median
+  occasional_monthly_rate_sigma: 0.6
+  # Days from signup (or sim start) to first COD order: exponential mean.
+  first_cod_lag_mean_days: 7
+  # How long a buyer keeps using COD before stopping: exponential mean (days).
+  active_days_mean_regular: 600
+  active_days_mean_occasional: 60
+
+  # Sudden spikes: extra orders squeezed into one 30-day window.
+  spike_share: 0.06
+  spike_extra_orders: [5, 8]                # inclusive range
+  spike_window_days: 30
+
+  # Order value: each buyer has a usual level (latent_aov); orders vary around it.
+  aov_median_thb: 400
+  aov_sigma: 0.6
+  aov_min_thb: 60
+  aov_max_thb: 5000
+  order_value_sigma: 0.30
+  big_order_share: 0.05                     # share of orders that are 3-6x usual
+  big_order_multiplier: [3.0, 6.0]
+  min_order_value_thb: 29
+
+  # Order hour: 8% placed 01:00-04:59, the rest spread over other hours with an evening peak.
+  late_night_share: 0.08
+  evening_peak_hours: [19, 20, 21, 22]
+  evening_peak_weight: 2.0
+
+  # Campaign days (1.1, 2.2, ... 11.11, 12.12) get more orders.
+  campaign_day_order_weight: 3.0
+
+  # same_item_other_shops_48h: chance of >= 1 = base + slope * latent_wont
+  same_item_base_prob: 0.03
+  same_item_wont_slope: 0.80
+  same_item_count_values: [1, 2, 3]
+  same_item_count_probs: [0.70, 0.20, 0.10]
+
+# ---------------------------------------------------------------------------
+# Hidden buyer traits (never shown to the model)
+# Each component: share of buyers, mean, Beta concentration (higher = tighter).
+# ---------------------------------------------------------------------------
+latent:
+  wont_mixture:
+    - {share: 0.80, mean: 0.01, concentration: 100}
+    - {share: 0.17, mean: 0.05, concentration: 60}
+    - {share: 0.03, mean: 0.30, concentration: 20}
+  # Share of the HIGH won't group by signup period (the low group absorbs the
+  # difference). Throwaway accounts used for COD abuse tend to be new, so recent
+  # signups have a larger high group. Overall it stays close to 3%.
+  wont_high_share_by_period:
+    before_sim: 0.02
+    history_window: 0.02
+    model_window: 0.04
+  cant_mixture:
+    - {share: 0.90, mean: 0.005, concentration: 200}
+    - {share: 0.10, mean: 0.03, concentration: 60}
+  drift_share: 0.10          # buyers whose latent_wont changes in the last 90 days
+  drift_up_share: 0.5        # of those, share that go up (x3); the rest go down (/3)
+  drift_factor: 3.0
+  drift_last_days: 90
+  max_latent: 0.90
+
+# ---------------------------------------------------------------------------
+# Hidden outcome rule (log-odds effects). See docs/hidden_rules.md.
+# ---------------------------------------------------------------------------
+effects:
+  wont:
+    same_item_per_shop: 1.0
+    same_item_cap: 2
+    value_2_to_3x: 0.35
+    value_3x_plus: 0.70
+    new_account_days: 30
+    new_account: 0.60
+    late_night: 0.50
+    freq_spike_threshold: 3.0
+    freq_spike: 0.40
+    campaign_day: 0.30
+    per_delivery_day_above: 2
+    per_delivery_day: 0.10
+    noise_sd: 0.5
+  cant:
+    april_or_late_december: 0.50
+    late_december_from_day: 20
+    condo_with_office: -0.70
+    per_delivery_day: 0.05
+    noise_sd: 0.3
+  logistics:
+    noise_sd: 0.2
+  max_total_failure_prob: 0.95
+
+# Calibration targets: mean chance over all model rows (Feb-Jul 2026).
+calibration:
+  target_wont: 0.0170
+  target_cant: 0.0073
+  target_logistics: 0.0018
+  # outcome becomes known this many days after expected delivery (uniform 0..x)
+  resolution_extra_days_max: 1.0
+
+# ---------------------------------------------------------------------------
+# Feature settings
+# ---------------------------------------------------------------------------
+features:
+  refusal_prior_rate: 0.026      # population COD failure rate used as the prior
+  refusal_prior_strength: 10     # prior is worth about 10 orders
+  recent_window_days: 90
+  freq_window_days: 30
+  freq_prior_monthly_rate: 1.0   # smoothing for the buyer's average monthly orders
+  freq_prior_months: 1.0
+  area_window_days: 90
+  area_prior_rate: 0.0018        # population logistics failure rate
+  area_prior_strength: 500       # prior is worth about 500 orders
+
+# ---------------------------------------------------------------------------
+# Validation thresholds (section 7 of the brief)
+# ---------------------------------------------------------------------------
+validation:
+  failure_rate_range: [0.024, 0.028]
+  mix_targets: {wont: 0.65, cant: 0.28, logistics: 0.07}
+  mix_tolerance: 0.05
+  top_share: 0.30
+  top_share_capture_range: [0.65, 0.75]
+  new_buyer_ratio_range: [1.2, 2.0]
+  sanity_auc_range: [0.70, 0.85]
+  best_single_feature_auc_max: 0.75
+  min_new_buyer_share: 0.25
+  # edge-case definitions
+  low_exposure_max_orders: 2          # 1-2 orders, all refused
+  high_exposure_min_orders: 30        # >= 30 orders ...
+  high_exposure_min_raw_rate: 0.30    # ... and >= 30% refused
+  drift_lifetime_max: 0.06            # smoothed lifetime rate at most this ...
+  drift_recent_min: 0.10              # ... while smoothed 90-day rate at least this
+  big_value_ratio: 3.0
+  high_area_quantile: 0.95            # top 5% of area_logistics_failure_rate (about 3 areas)
+  clean_buyer_min_orders: 5
+  freq_spike_ratio: 3.0
+
+# ===========================================================================
+# Model training (src/train.py). Test set is never used for tuning.
+# ===========================================================================
+model:
+  valid_share: 0.20            # last 20% of train rows (by order time) = validation set
+  calibration_method: platt    # "platt" (logistic on the raw log-odds) or "isotonic"
+  min_auc_gap_for_lgbm: 0.01   # LightGBM must beat Logistic Regression by this much to be recommended
+  early_stopping_rounds: 50
+  lgbm_base:
+    n_estimators: 500
+    learning_rate: 0.03
+    num_leaves: 31
+    min_child_samples: 100
+    subsample: 0.8
+    subsample_freq: 1          # needed so LightGBM actually uses `subsample`
+    colsample_bytree: 0.8
+  # At most 3 small changes from the base, each tried once on the validation set.
+  lgbm_variants:
+    - {num_leaves: 15}
+    - {min_child_samples: 300}
+    - {num_leaves: 15, min_child_samples: 300, learning_rate: 0.02}
+
+# ===========================================================================
+# Decision tiers and money simulation (src/decide.py)
+# ===========================================================================
+decision:
+  tier1_cutoff: 0.023          # p below this -> Tier 0 (nothing extra)
+  tier2_cutoff: 0.10           # p at or above this -> Tier 2
+  cost_failed_delivery_thb: 44          # case Exhibit 2
+  commission_per_order_thb: 60          # case Exhibit 3 (lost when an order fails or is lost)
+  catch_rate: {tier1: 0.40, tier2: 0.55}   # share of `wont` failures caught by Confirm (assumption)
+  caught_become_delivered: 0.30         # of caught, share that end up delivered (rest cancelled, cost 0)
+  friction: {tier1: 0.005, tier2: 0.010}   # share of good orders lost to the extra step (assumption)
+  message_cost_thb: 0.10                # per asked order (assumption)
+  yearly_orders_total: 407600000   # orders a year (case)
+  cod_share: 0.35                       # -> 142.7M COD orders a year
+  sensitivity_catch_rates: [0.25, 0.40, 0.50]   # replaces the Tier 1 rate; Tier 2 keeps its +15 pt gap
+  sensitivity_friction: [0.003, 0.005, 0.010]   # replaces the Tier 1 rate; Tier 2 stays 2x Tier 1

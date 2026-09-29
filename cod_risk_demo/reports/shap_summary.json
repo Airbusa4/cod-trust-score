@@ -1,0 +1,65 @@
+{
+  "note": "Synthetic data, for illustration only. Not Shopee data.",
+  "top10_lgbm": [
+    {
+      "rank": 1,
+      "feature": "refusal_rate_smoothed",
+      "name": "Refusal rate (smoothed)",
+      "matches_hidden_rule": true
+    },
+    {
+      "rank": 2,
+      "feature": "account_age_days",
+      "name": "Account age (days)",
+      "matches_hidden_rule": true
+    },
+    {
+      "rank": 3,
+      "feature": "area_logistics_failure_rate",
+      "name": "Area courier failure rate (90d)",
+      "matches_hidden_rule": true
+    },
+    {
+      "rank": 4,
+      "feature": "same_item_other_shops_48h",
+      "name": "Same item at other shops (48h)",
+      "matches_hidden_rule": true
+    },
+    {
+      "rank": 5,
+      "feature": "recent_refusal_rate_smoothed_90d",
+      "name": "Refusal rate, last 90 days",
+      "matches_hidden_rule": true
+    },
+    {
+      "rank": 6,
+      "feature": "order_value",
+      "name": "Order value (THB)",
+      "matches_hidden_rule": false
+    },
+    {
+      "rank": 7,
+      "feature": "value_vs_aov",
+      "name": "Value vs buyer's usual",
+      "matches_hidden_rule": true
+    },
+    {
+      "rank": 8,
+      "feature": "order_month",
+      "name": "Order month",
+      "matches_hidden_rule": false
+    },
+    {
+      "rank": 9,
+      "feature": "hist_cod_orders",
+      "name": "Past COD orders",
+      "matches_hidden_rule": false
+    },
+    {
+      "rank": 10,
+      "feature": "freq_change_ratio",
+      "name": "Order frequency change (30d)",
+      "matches_hidden_rule": true
+    }
+  ]
+}

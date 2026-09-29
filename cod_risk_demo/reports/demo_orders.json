@@ -1,0 +1,136 @@
+{
+  "note": "Synthetic data, for illustration only. Not Shopee data.",
+  "model": "Logistic Regression",
+  "tier_cutoffs": {
+    "tier1": 0.023,
+    "tier2": 0.1
+  },
+  "orders": {
+    "A": {
+      "label": "risky",
+      "order_id": 25390,
+      "order_datetime": "2026-07-02 04:44:54",
+      "risk": 0.1567,
+      "tier": 2,
+      "action": "Confirm + choose prepaid, deposit or call",
+      "facts": {
+        "Order value": "฿3,694",
+        "Value vs usual": "10.5x",
+        "Order time": "04:44",
+        "Account age": "67 days",
+        "Past COD orders": "4",
+        "Past refusals": "1",
+        "Same item at other shops (48h)": "1",
+        "Expected delivery": "2 days"
+      },
+      "features": {
+        "hist_cod_orders": 4,
+        "hist_refusals": 1,
+        "refusal_rate_smoothed": 0.09,
+        "recent_refusal_rate_smoothed_90d": 0.09,
+        "days_since_last_refusal": 46,
+        "has_ever_refused": 1,
+        "hist_buyer_caused_misses": 0,
+        "hist_courier_caused_failures": 0,
+        "order_value": 3694,
+        "value_vs_aov": 10.5018,
+        "freq_change_ratio": 0.5766,
+        "account_age_days": 67,
+        "is_new_cod_buyer": 0,
+        "is_late_night": 1,
+        "same_item_other_shops_48h": 1,
+        "is_campaign_day": 0,
+        "expected_days_to_delivery": 2,
+        "area_logistics_failure_rate": 0.002494,
+        "address_is_condo_with_office": 0,
+        "order_month": 7
+      },
+      "reasons": [
+        {
+          "feature": "same_item_other_shops_48h",
+          "name": "Same item at other shops (48h)",
+          "text": "Same item ordered with COD at 1 other shop in 48h",
+          "shap": 0.879,
+          "direction": "up"
+        },
+        {
+          "feature": "refusal_rate_smoothed",
+          "name": "Refusal rate (smoothed)",
+          "text": "Refused 1 of 4 past COD parcels",
+          "shap": 0.649,
+          "direction": "up"
+        },
+        {
+          "feature": "hist_cod_orders",
+          "name": "Past COD orders",
+          "text": "Only 4 past COD orders (little track record)",
+          "shap": 0.203,
+          "direction": "up"
+        }
+      ]
+    },
+    "B": {
+      "label": "safe",
+      "order_id": 164525,
+      "order_datetime": "2026-07-06 20:11:43",
+      "risk": 0.0048,
+      "tier": 0,
+      "action": "Nothing extra",
+      "facts": {
+        "Order value": "฿227",
+        "Value vs usual": "0.8x",
+        "Order time": "20:11",
+        "Account age": "594 days",
+        "Past COD orders": "81",
+        "Past refusals": "0",
+        "Same item at other shops (48h)": "0",
+        "Expected delivery": "1 day"
+      },
+      "features": {
+        "hist_cod_orders": 81,
+        "hist_refusals": 0,
+        "refusal_rate_smoothed": 0.002857,
+        "recent_refusal_rate_smoothed_90d": 0.01,
+        "days_since_last_refusal": -1,
+        "has_ever_refused": 0,
+        "hist_buyer_caused_misses": 0,
+        "hist_courier_caused_failures": 0,
+        "order_value": 227,
+        "value_vs_aov": 0.8144,
+        "freq_change_ratio": 1.1026,
+        "account_age_days": 594,
+        "is_new_cod_buyer": 0,
+        "is_late_night": 0,
+        "same_item_other_shops_48h": 0,
+        "is_campaign_day": 0,
+        "expected_days_to_delivery": 1,
+        "area_logistics_failure_rate": 0.000818,
+        "address_is_condo_with_office": 1,
+        "order_month": 7
+      },
+      "reasons": [
+        {
+          "feature": "hist_cod_orders",
+          "name": "Past COD orders",
+          "text": "81 past COD orders (long track record)",
+          "shap": -0.895,
+          "direction": "down"
+        },
+        {
+          "feature": "refusal_rate_smoothed",
+          "name": "Refusal rate (smoothed)",
+          "text": "Refused 0 of 81 past COD parcels",
+          "shap": -0.159,
+          "direction": "down"
+        },
+        {
+          "feature": "expected_days_to_delivery",
+          "name": "Expected delivery days",
+          "text": "Delivery expected in 1 day",
+          "shap": -0.118,
+          "direction": "down"
+        }
+      ]
+    }
+  }
+}

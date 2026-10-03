@@ -14,6 +14,7 @@ Data comes from cod_risk_demo/app_data/ (built by `python -m src.export_app`).
 """
 import datetime as dt
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -23,7 +24,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from risk_ui import importer
+if __name__ == "__main__":  # started as `streamlit run risk_ui/app.py`: make the repo root importable
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from risk_ui import importer  # noqa: E402
 from risk_ui.model import (DEPOSIT_SHARE, NICE_NAMES, TIER_ACTIONS, TIER_COLORS, TIER_CUTOFFS,
                            TIER_NAMES, TIER_RANGES, TIER_TEXT_ON, TIERS, COST_FORMULA, Model, assign_tiers, cost_of_failure,
                            features_from_inputs, top_reasons)
@@ -971,3 +975,8 @@ def data_source_picker(demo):
             st.session_state.pop("in_load_id", None)
         st.session_state["active_source"] = source
     return imp["df"] if source == IMPORTED and imp else demo
+
+
+if __name__ == "__main__":  # same as the root app.py, so either file works as the start file
+    st.set_page_config(page_title="COD Risk Score", page_icon="🛡️", layout="wide")
+    render()

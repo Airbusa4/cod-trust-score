@@ -2,5 +2,4 @@ streamlit>=1.64
 pandas>=2.0
 numpy>=1.26
 plotly>=5.20
-anthropic>=0.40
 openpyxl>=3.1

@@ -3,16 +3,20 @@
 SYNTHETIC DATA - for illustration only. This is NOT real Shopee data.
 
 Pages:
-  Dashboard         - KPIs, risk distribution, tiers, capture curve, segments,
-                      areas (incl. fairness), calibration, weekly trend
+  Dashboard         - KPIs, risk distribution, tiers, risk trend (daily / weekly / monthly)
   Orders            - every order (filterable, sortable) + full detail of one order
   Score an order    - type raw order / buyer data, get the risk score, tier and reasons
-  Policy simulator  - move the cut-offs and assumptions, see the money change
+  Policy simulator  - move the tier cut-offs and assumptions, see the money change
+  Model performance - predicted risk vs actual outcomes, train vs test, LR vs LightGBM
+  Import data       - upload a CSV / Excel file of orders, check it in a pop-up, score it;
+                      every page can then show the imported orders instead of the demo data
 
+Every number shown comes from the model's predicted risk; actual outcomes are not shown.
 Data comes from cod_risk_demo/app_data/ (built by `python -m src.export_app`).
 """
 import datetime as dt
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,15 +25,34 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from risk_ui.model import (NICE_NAMES, OUTCOME_NAMES, TIER_ACTIONS, TIER_COLORS, TIER_NAMES, Model,
-                           assign_tiers, features_from_inputs, simulate, top_reasons)
+from risk_ui import importer
+from risk_ui import performance as pf
+from risk_ui.model import (DEPOSIT_SHARE, NICE_NAMES, SIM_DEFAULTS, TIER_ACTIONS, TIER_COLORS, TIER_CUTOFFS,
+                           TIER_NAMES, TIER_RANGES, TIER_TEXT_ON, TIERS, COST_FORMULA, Model, assign_tiers, cost_of_failure,
+                           features_from_inputs, simulate, top_reasons)
 
 APP_DATA = Path(__file__).resolve().parent.parent / "cod_risk_demo" / "app_data"
-NOTE = "Synthetic data, for illustration only. Not Shopee data."
-PAGES = ["Dashboard", "Orders", "Score an order", "Policy simulator"]
+DEMO_NOTE = "Synthetic data, for illustration only. Not Shopee data."
+
+
+def note():
+    """The data note shown on every page and chart: says which data is on screen."""
+    imp = st.session_state.get("imported")
+    if st.session_state.get("active_source") == IMPORTED and imp:
+        return f"Imported data ({imp['name']}), scored by a model trained on synthetic data."
+    return DEMO_NOTE
+PAGES = ["Dashboard", "Orders", "Score an order", "Policy simulator", "Model performance", "Import data"]
+DEMO, IMPORTED = "Demo data", "Imported file"
 TIER_COLOR_BY_NAME = {TIER_NAMES[k]: v for k, v in TIER_COLORS.items()}
-OUTCOME_COLORS = {"Delivered": "#9aa0a6", "Refused (won't)": "#d93025",
-                  "Not home / no cash (can't)": "#c77700", "Courier problem (logistics)": "#1a73e8"}
+# Theme colours (black / orange / white; the rest of the theme is in .streamlit/config.toml).
+ACCENT = "#f47b20"        # the one series a chart is about
+CONTEXT = "#9a9aa0"       # the series it is compared with
+LOWERS = "#c9c9cc"        # factor pushes risk down (vs ACCENT = pushes it up)
+
+
+def tier_badge(tier, size=20):
+    return (f"<span style='display:inline-block;font-weight:750;font-size:{size}px;padding:4px 14px;border-radius:999px;"
+            f"background:{TIER_COLORS[tier]};color:{TIER_TEXT_ON[tier]}'>{TIER_NAMES[tier]}</span>")
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +63,7 @@ def load():
     params = json.loads((APP_DATA / "model_params.json").read_text(encoding="utf-8"))
     df = pd.read_csv(APP_DATA / "orders.csv", comment="#")
     df["order_datetime"] = pd.to_datetime(df["order_datetime"])
-    df["outcome"] = df["failure_type"].map(OUTCOME_NAMES)
+    df["tier"] = assign_tiers(df["risk"].to_numpy())
     df["tier_name"] = df["tier"].map(TIER_NAMES)
     df["risk_pct"] = df["risk"] * 100
     return params, df
@@ -51,11 +74,16 @@ def get_model(params_json):
     return Model(json.loads(params_json))
 
 
-def show(fig, height=380):
-    """Plot with the synthetic-data note in the corner."""
+def show(fig, height=380, value_axis="y", bottom=50, subtitle=None):
+    """Plot with the synthetic-data note in the corner and recessive chrome
+    (hairline solid grid on the value axis only, rounded bar ends)."""
     title = fig.layout.title.text or ""
-    fig.update_layout(title_text=f"{title}<br><sup style='color:#888'>{NOTE}</sup>", height=height,
-                      margin=dict(t=70, b=50, l=10, r=10))
+    fig.update_layout(title_text=f"{title}<br><sup style='color:#8a8a90'>{subtitle or note()}</sup>", height=height,
+                      margin=dict(t=72, b=bottom, l=10, r=10), barcornerradius=4,
+                      font=dict(size=14), title_font=dict(size=17), legend_font=dict(size=13))
+    value, category = (fig.update_yaxes, fig.update_xaxes) if value_axis == "y" else (fig.update_xaxes, fig.update_yaxes)
+    value(gridwidth=1, griddash="solid", zeroline=False)
+    category(showgrid=False, zeroline=False)
     st.plotly_chart(fig, width="stretch")
 
 
@@ -63,131 +91,189 @@ def pct(x, d=1):
     return f"{x * 100:.{d}f}%"
 
 
+def baht(x):
+    return f"฿{x / 1e6:,.2f}M" if abs(x) >= 1e6 else f"฿{x:,.0f}"
+
+
 # ---------------------------------------------------------------------------
-# Filters (sidebar). Every widget key starts with "f_" so it can be reset.
+# Filters. Two independent sets, each with its own key prefix so it can be reset:
+#   "fd_" = the Dashboard's row of filters, "f_" = the Orders page panel
+#   (the Policy simulator can reuse the Orders page result).
+# A filter spec is (column, kind, label); kinds: date, multi, bool, range, ids, id.
 # ---------------------------------------------------------------------------
-FILTERS = {
+DASHBOARD_FILTERS = [("order_datetime", "date", "Order date"), ("tier", "multi", "Tier"),
+                     ("area_id", "multi", "Area"), ("split", "multi", "Split")]
+ORDERS_MAIN_FILTERS = [("order_id", "ids", "Order IDs"), ("buyer_id", "id", "Buyer ID"),
+                       ("order_datetime", "date", "Order date"), ("tier", "multi", "Tier")]
+ORDERS_MORE_FILTERS = {
     "Order": [
-        ("order_datetime", "date", "Order date"),
-        ("split", "multi", "Split (train = Feb-Jun, test = Jul)"),
-        ("order_month", "multi", "Order month"),
         ("order_value", "range", "Order value (THB)"),
         ("value_vs_aov", "range", "Value vs buyer's usual (x)"),
         ("order_hour", "range", "Order hour"),
+        ("order_month", "multi", "Order month"),
         ("is_late_night", "bool", "Late night (01:00-04:59)"),
         ("is_campaign_day", "bool", "Campaign day"),
         ("same_item_other_shops_48h", "range", "Same item at other shops (48h)"),
         ("expected_days_to_delivery", "range", "Expected delivery days"),
         ("freq_change_ratio", "range", "Order frequency change (30d)"),
+        ("split", "multi", "Split (train = Feb-Jun, test = Jul)"),
     ],
     "Buyer": [
         ("is_new_cod_buyer", "bool", "First COD order (no history)"),
+        ("has_ever_refused", "bool", "Has ever refused"),
+        ("address_is_condo_with_office", "bool", "Condo with front office"),
         ("hist_cod_orders", "range", "Past COD orders"),
         ("hist_refusals", "range", "Past refusals"),
-        ("has_ever_refused", "bool", "Has ever refused"),
+        ("account_age_days", "range", "Account age (days)"),
         ("refusal_rate_smoothed", "range", "Refusal rate (smoothed)"),
         ("recent_refusal_rate_smoothed_90d", "range", "Refusal rate, last 90 days"),
         ("days_since_last_refusal", "range", "Days since last refusal (-1 = never)"),
         ("hist_buyer_caused_misses", "range", "Past 'not home / no cash' misses"),
         ("hist_courier_caused_failures", "range", "Past courier failures"),
-        ("account_age_days", "range", "Account age (days)"),
-        ("address_is_condo_with_office", "bool", "Condo with front office"),
     ],
-    "Area": [
+    "Area & score": [
         ("area_id", "multi", "Area"),
         ("area_logistics_failure_rate", "range", "Area courier failure rate (90d)"),
-    ],
-    "Score & outcome": [
         ("risk_pct", "range", "Risk score (%)"),
-        ("tier", "multi", "Tier"),
-        ("outcome", "multi", "Actual outcome (synthetic truth)"),
     ],
 }
+ORDERS_ALL_FILTERS = ORDERS_MAIN_FILTERS + [x for specs in ORDERS_MORE_FILTERS.values() for x in specs]
 
 
-def reset_filters():
-    for k in [k for k in st.session_state if k.startswith("f_")]:
+def reset_filters(prefix):
+    for k in [k for k in st.session_state if k.startswith(prefix)]:
         del st.session_state[k]
 
 
-def filter_panel(df):
-    """Draw every filter in the sidebar and return the filtered orders."""
-    sb = st.sidebar
-    sb.markdown("### Filters")
-    sb.button("Reset all filters", on_click=reset_filters, width="stretch")
-    mask = pd.Series(True, index=df.index)
-    active = 0
+def bounds(s):
+    is_int = pd.api.types.is_integer_dtype(s)
+    return ((int(s.min()), int(s.max())) if is_int else (float(s.min()), float(s.max()))), is_int
 
-    with sb.expander("Search by ID", expanded=False):
-        ids = st.text_input("Order IDs (comma separated)", key="f_order_ids")
-        buyer = st.text_input("Buyer ID", key="f_buyer_id")
-    if ids.strip():
-        wanted = [int(x) for x in ids.replace(" ", "").split(",") if x.isdigit()]
-        mask &= df["order_id"].isin(wanted)
-        active += 1
-    if buyer.strip().isdigit():
-        mask &= df["buyer_id"] == int(buyer)
-        active += 1
 
-    for group, specs in FILTERS.items():
-        with sb.expander(group, expanded=(group == "Score & outcome")):
-            for col, kind, label in specs:
-                key = f"f_{col}"
-                s = df[col]
-                if kind == "date":
-                    lo, hi = s.min().date(), s.max().date()
-                    init = {} if key in st.session_state else {"value": (lo, hi)}
-                    val = st.date_input(label, min_value=lo, max_value=hi, key=key, **init)
-                    if isinstance(val, (tuple, list)) and len(val) == 2 and (val[0] > lo or val[1] < hi):
-                        mask &= s.dt.date.between(val[0], val[1])
-                        active += 1
-                elif kind == "multi":
-                    opts = sorted(s.dropna().unique().tolist())
-                    fmt = (lambda t: TIER_NAMES[t]) if col == "tier" else str
-                    val = st.multiselect(label, opts, key=key, format_func=fmt, placeholder="All")
-                    if val:
-                        mask &= s.isin(val)
-                        active += 1
-                elif kind == "bool":
-                    val = st.selectbox(label, ["Any", "Yes", "No"], key=key)
-                    if val != "Any":
-                        mask &= s == (1 if val == "Yes" else 0)
-                        active += 1
-                else:  # range
-                    is_int = pd.api.types.is_integer_dtype(s)
-                    lo, hi = (int(s.min()), int(s.max())) if is_int else (float(s.min()), float(s.max()))
-                    if lo == hi:
-                        continue
-                    step = 1 if is_int else float(f"{(hi - lo) / 200:.2g}")
-                    init = {} if key in st.session_state else {"value": (lo, hi)}
-                    val = st.slider(label, lo, hi, step=step, key=key, **init)
-                    if val[0] > lo or val[1] < hi:
-                        mask &= s.between(val[0] - 1e-9, val[1] + 1e-9)
-                        active += 1
+def filter_widget(df, spec, prefix):
+    """Draw one filter widget (its value lives in st.session_state[prefix + column])."""
+    col, kind, label = spec
+    key, s = prefix + col, df[col]
+    if kind == "ids":
+        st.text_input(label, key=key, placeholder="e.g. 3, 17, 2041")
+    elif kind == "id":
+        st.text_input(label, key=key, placeholder="e.g. 1250")
+    elif kind == "date":
+        lo, hi = s.min().date(), s.max().date()
+        init = {} if key in st.session_state else {"value": (lo, hi)}
+        st.date_input(label, min_value=lo, max_value=hi, key=key, **init)
+    elif kind == "multi":
+        fmt = (lambda t: TIER_NAMES[t]) if col == "tier" else str
+        st.multiselect(label, sorted(s.dropna().unique().tolist()), key=key, format_func=fmt, placeholder="All")
+    elif kind == "bool":
+        st.selectbox(label, ["Any", "Yes", "No"], key=key)
+    else:  # range
+        (lo, hi), is_int = bounds(s)
+        if lo == hi:
+            return
+        step = 1 if is_int else float(f"{(hi - lo) / 200:.2g}")
+        init = {} if key in st.session_state else {"value": (lo, hi)}
+        st.slider(label, lo, hi, step=step, key=key, **init)
 
-    out = df[mask]
-    sb.caption(f"**{len(out):,}** of {len(df):,} orders · {active} filter(s) active")
+
+def filter_state(df, spec, prefix):
+    """(mask, short description) for one filter from its saved value, or None if it filters nothing."""
+    col, kind, label = spec
+    val, s = st.session_state.get(prefix + col), df[col]
+    if val is None:
+        return None
+    if kind == "ids":
+        wanted = [int(x) for x in str(val).replace(" ", "").split(",") if x.isdigit()]
+        return (s.isin(wanted), f"{label}: {', '.join(map(str, wanted))}") if wanted else None
+    if kind == "id":
+        return (s == int(val), f"{label}: {int(val)}") if str(val).strip().isdigit() else None
+    if kind == "date":
+        lo, hi = s.min().date(), s.max().date()
+        if isinstance(val, (tuple, list)) and len(val) == 2 and (val[0] > lo or val[1] < hi):
+            return s.dt.date.between(val[0], val[1]), f"{label}: {val[0]:%d %b} – {val[1]:%d %b %Y}"
+        return None
+    if kind == "multi":
+        if not val:
+            return None
+        shown = [TIER_NAMES[v].split(" · ")[0] if col == "tier" else str(v) for v in val]
+        return s.isin(val), f"{label}: {', '.join(shown)}"
+    if kind == "bool":
+        return (s == (1 if val == "Yes" else 0), f"{label}: {val}") if val != "Any" else None
+    (lo, hi), _ = bounds(s)
+    if lo < hi and (val[0] > lo or val[1] < hi):
+        return s.between(val[0] - 1e-9, val[1] + 1e-9), f"{label}: {fmt_num(val[0])} – {fmt_num(val[1])}"
+    return None
+
+
+def fmt_num(v):
+    """Readable number for filter chips: 26,890 / 12 / 0.0015 / 2.5."""
+    if abs(v) >= 1000 or float(v).is_integer():
+        return f"{v:,.0f}"
+    return f"{v:.3g}"
+
+
+def apply_filters(df, specs, prefix):
+    """Filtered orders + descriptions of the active filters, from the saved filter values."""
+    active = [x for x in (filter_state(df, spec, prefix) for spec in specs) if x is not None]
+    out = df[np.logical_and.reduce([m for m, _ in active])] if active else df
+    return out, [text for _, text in active]
+
+
+def filter_chips(texts, n_shown, n_all):
+    chips = "".join(f"<span style='display:inline-block;padding:2px 10px;margin:2px 4px 2px 0;border-radius:999px;"
+                    f"background:rgba(128,128,128,.15);font-size:13px'>{t}</span>" for t in texts)
+    st.markdown(f"<div style='font-size:14px'><b>{n_shown:,}</b> of {n_all:,} orders"
+                f"{' · ' + str(len(texts)) + ' filter(s):' if texts else ' · no filters'}</div>"
+                f"<div>{chips}</div>", unsafe_allow_html=True)
+
+
+def dashboard_filters(df):
+    """The Dashboard's single row of filters; returns the filtered orders."""
+    with st.container(border=True):
+        cols = st.columns([1.4, 1.4, 1, 1, 0.8], vertical_alignment="bottom")
+        for c, spec in zip(cols, DASHBOARD_FILTERS):
+            with c:
+                filter_widget(df, spec, "fd_")
+        cols[-1].button("Reset filters", on_click=reset_filters, args=("fd_",), width="stretch", key="reset_dashboard_filters")
+        out, texts = apply_filters(df, DASHBOARD_FILTERS, "fd_")
+        if texts:
+            filter_chips(texts, len(out), len(df))
     return out
 
 
-def in_sample_warning(d):
-    if (d["split"] == "train").any():
-        st.info("Feb-Jun orders were used to train the model, so their scores look better than they "
-                "really are. Filter **Split = test** (July) for honest numbers.", icon="ℹ️")
+def orders_filter_panel(df):
+    """The Orders page filter panel: main filters in one row, the rest in tabs. Returns the filtered orders."""
+    with st.container(border=True):
+        cols = st.columns([1.2, 0.8, 1.4, 1.4, 0.8], vertical_alignment="bottom")
+        for c, spec in zip(cols, ORDERS_MAIN_FILTERS):
+            with c:
+                filter_widget(df, spec, "f_")
+        cols[-1].button("Reset filters", on_click=reset_filters, args=("f_",), width="stretch", key="reset_orders_filters")
+        with st.expander("More filters: order, buyer, area and score"):
+            for tab, specs in zip(st.tabs(list(ORDERS_MORE_FILTERS)), ORDERS_MORE_FILTERS.values()):
+                with tab:
+                    grid = st.columns(3)
+                    for i, spec in enumerate(specs):
+                        with grid[i % 3]:
+                            filter_widget(df, spec, "f_")
+        out, texts = apply_filters(df, ORDERS_ALL_FILTERS, "f_")
+        filter_chips(texts, len(out), len(df))
+    return out
 
 
 # ---------------------------------------------------------------------------
-# One order: facts, score, reasons, phone
+# One order: score, reasons, factor chart, phone
 # ---------------------------------------------------------------------------
 PHONE_CSS = """
 <style>
-.phone{width:300px;height:560px;border-radius:40px;background:#111;padding:12px;margin:0 auto}
+.phone{width:300px;height:560px;border-radius:40px;background:#000;border:2px solid #3a3a40;padding:12px;margin:0 auto}
 .screen{background:#fff;border-radius:30px;height:100%;overflow:hidden;display:flex;flex-direction:column;color:#1d2330}
 .appbar{background:#ee4d2d;color:#fff;font-weight:700;padding:28px 16px 12px;font-size:17px}
 .pbody{padding:16px;display:flex;flex-direction:column;gap:10px}
 .ptitle{font-size:21px;font-weight:750;line-height:1.2}.psub{font-size:14px;color:#5d6677}
 .pbtn{font-size:15px;font-weight:650;padding:11px;border-radius:10px;text-align:center;border:2px solid #e3e6ec}
-.main{background:#ee4d2d;color:#fff;border-color:#ee4d2d}.offer{background:#fff4e0;border-color:#f3d19c;color:#7a4a00;text-align:left}
+.main{background:#ee4d2d;color:#fff;border-color:#ee4d2d}
+.pnote{font-size:13px;padding:10px;border-radius:10px;background:#fff4e0;color:#7a4a00}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .check{width:64px;height:64px;border-radius:50%;background:#e6f4ea;color:#1e8e3e;font-size:36px;display:flex;
        align-items:center;justify-content:center;margin:24px auto 4px}
@@ -197,249 +283,208 @@ PHONE_CSS = """
 
 def phone_html(tier, value):
     v = f"฿{value:,.0f}"
-    if tier == 0:
+    if tier == 1:
         body = (f'<div class="check">✓</div><div class="ptitle" style="text-align:center">Order placed</div>'
-                f'<div class="psub" style="text-align:center">{v} · Cash on delivery.<br>Pay the courier when your parcel arrives.</div>')
+                f'<div class="psub" style="text-align:center">{v} · Cash on delivery.<br>Pay the courier when your parcel arrives.</div>'
+                '<div class="pnote">🔔 We will remind you before delivery so you can have the cash ready.</div>')
+    elif tier == 2:
+        body = (f'<div class="ptitle">Confirm your {v} COD order</div>'
+                '<div class="psub">Your order is on hold. Please confirm you will be home to receive and pay for it.</div>'
+                '<div class="pbtn main">Confirm</div><div class="row2"><div class="pbtn">Cancel</div><div class="pbtn">Pay now</div></div>'
+                '<div class="pnote">We ship as soon as you confirm.</div>')
+    elif tier == 3:
+        dep = f"฿{value * DEPOSIT_SHARE:,.0f}"
+        body = (f'<div class="ptitle">Pay a {dep} deposit to keep COD</div>'
+                f'<div class="psub">A refundable deposit (10% of {v}) is needed for this cash-on-delivery order.</div>'
+                f'<div class="pbtn main">Pay {dep} deposit</div><div class="row2"><div class="pbtn">Cancel</div><div class="pbtn">Pay in full</div></div>'
+                '<div class="pnote">The deposit is refunded when you receive and pay for the parcel.</div>')
     else:
-        body = (f'<div class="ptitle">Ready to ship {v} COD</div>'
-                '<div class="psub">Please confirm you will be home to receive and pay for this parcel.</div>'
-                '<div class="pbtn main">Confirm</div><div class="row2"><div class="pbtn">Cancel</div><div class="pbtn">Pay now</div></div>')
-        if tier == 2:
-            body += ('<div class="pbtn offer">Pay now and get ฿10 coins</div>'
-                     '<div class="pbtn offer">Keep COD with ฿20 deposit</div>')
+        body = ('<div class="ptitle">COD is not available for this order</div>'
+                f'<div class="psub">Please pay {v} now to place this order.</div>'
+                f'<div class="pbtn main">Pay now {v}</div><div class="pbtn">Cancel</div>')
     return f'{PHONE_CSS}<div class="phone"><div class="screen"><div class="appbar">Checkout</div><div class="pbody">{body}</div></div></div>'
 
 
-def order_view(feats, order_hour, model, params, extra=None):
-    """Show one order. `feats` = Series of the 20 features. `extra` = dict of audit info (optional)."""
+def score_order(feats, order_hour, model):
+    """Risk, tier, top-3 reasons and every factor's push for ONE order (`feats` = Series of the 20 features)."""
     X = feats.to_frame().T.astype(float)
     p = float(model.predict(X)[0])
-    tier = int(assign_tiers(np.array([p]), params["decision"])[0])
     reasons, phi = top_reasons(model, X, order_hour)
+    return p, int(assign_tiers([p])[0]), reasons, phi
+
+
+def score_block(p, tier, reasons, params):
     avg = params["population_failure_rate"]
+    st.markdown("##### Risk of failed delivery")
+    st.markdown(f"<div style='font-size:56px;font-weight:800;line-height:1'>{p:.1%}</div>"
+                f"<div style='opacity:.7'>vs about {avg:.1%} on average ({p / avg:.1f}x)</div>",
+                unsafe_allow_html=True)
+    st.markdown(f"<div style='margin:12px 0'>{tier_badge(tier)}</div>", unsafe_allow_html=True)
+    st.markdown(f"**Action:** {TIER_ACTIONS[tier]}")
+    st.markdown("##### Top 3 reasons")
+    for r in reasons:
+        arrow, color, word = ("▲", ACCENT, "raises") if r["direction"] == "up" else ("▼", LOWERS, "lowers")
+        st.markdown(f"<div style='font-size:17px;margin:6px 0'><span style='color:{color};font-weight:800'>{arrow}</span> "
+                    f"<b>{r['text']}</b><br><span style='opacity:.65;font-size:13px'>{word} risk vs an average order · "
+                    f"{r['name']} ({r['shap']:+.2f} log-odds)</span></div>", unsafe_allow_html=True)
 
-    left, mid, right = st.columns([1.1, 1.3, 0.9])
-    with left:
-        st.markdown("##### Risk of failed delivery")
-        st.markdown(f"<div style='font-size:56px;font-weight:800;color:{TIER_COLORS[tier]};line-height:1'>{p:.1%}</div>"
-                    f"<div style='color:#5d6677'>vs about {avg:.1%} on average ({p / avg:.1f}x)</div>",
-                    unsafe_allow_html=True)
-        bg = {0: "#e6f4ea", 1: "#fff4e0", 2: "#fce8e6"}[tier]
-        st.markdown(f"{PHONE_CSS}<div class='badge' style='background:{bg};color:{TIER_COLORS[tier]};margin:12px 0'>"
-                    f"{TIER_NAMES[tier]}</div>", unsafe_allow_html=True)
-        st.markdown(f"**Action:** {TIER_ACTIONS[tier]}")
-        st.markdown("##### Top 3 reasons")
-        for r in reasons:
-            arrow, color, word = ("▲", "#d93025", "raises") if r["direction"] == "up" else ("▼", "#1e8e3e", "lowers")
-            st.markdown(f"<div style='font-size:17px;margin:6px 0'><span style='color:{color};font-weight:800'>{arrow}</span> "
-                        f"<b>{r['text']}</b><br><span style='color:#5d6677;font-size:13px'>{word} risk · {r['name']} "
-                        f"({r['shap']:+.2f} log-odds)</span></div>", unsafe_allow_html=True)
-    with mid:
-        st.markdown("##### What pushes this order's risk (all factors)")
-        contrib = pd.DataFrame({"factor": [NICE_NAMES[f] for f in model.features], "push": phi})
-        contrib = contrib.reindex(contrib["push"].abs().sort_values().index)
-        fig = go.Figure(go.Bar(x=contrib["push"], y=contrib["factor"], orientation="h",
-                               marker_color=np.where(contrib["push"] > 0, "#d93025", "#1e8e3e")))
-        fig.update_layout(xaxis_title="push on risk (log-odds, vs an average order)", yaxis_title=None)
-        show(fig, height=520)
-    with right:
-        st.markdown("##### What the buyer sees")
-        st.markdown(phone_html(tier, float(feats["order_value"])), unsafe_allow_html=True)
 
-    with st.expander("Model inputs (the 20 features)"):
-        st.dataframe(pd.DataFrame({"feature": [NICE_NAMES[f] for f in model.features], "column": model.features,
-                                   "value": [feats[f] for f in model.features],
-                                   "push (log-odds)": np.round(phi, 3)}), hide_index=True, width="stretch")
-    if extra:
-        with st.expander("Simulation truth (audit only, never a model input)"):
-            st.markdown(f"- Actual outcome: **{extra['outcome']}**\n"
-                        f"- True failure chance used by the generator: **{extra['p_true']:.2%}** "
-                        f"(model said {p:.2%})")
-    return p, tier
+def factor_chart(phi, model, height=520):
+    contrib = pd.DataFrame({"factor": [NICE_NAMES[f] for f in model.features], "push": phi})
+    contrib = contrib.reindex(contrib["push"].abs().sort_values().index)
+    fig = go.Figure(go.Bar(x=contrib["push"], y=contrib["factor"], orientation="h",
+                           marker_color=np.where(contrib["push"] > 0, ACCENT, LOWERS)))
+    fig.update_layout(title="What pushes this order's risk (all 20 factors)",
+                      xaxis_title="push on risk (log-odds, vs an average order)", yaxis_title=None)
+    show(fig, height=height, value_axis="x")
 
 
 # ---------------------------------------------------------------------------
 # Page: Dashboard
 # ---------------------------------------------------------------------------
-def seg_hour(d):
-    return pd.Series(np.select([d.order_hour.between(1, 4), d.order_hour.between(5, 11), d.order_hour.between(12, 17)],
-                               ["01-04 (late night)", "05-11", "12-17"], "18-00"), index=d.index)
+TREND_FREQ = {"Daily": ("D", "day"), "Weekly": ("W", "week"), "Monthly": ("MS", "month")}
+TREND_MEASURES = ["Mean predicted risk", "Predicted cost lost", "Orders"]
 
 
-SEGMENTS = {
-    "Past COD orders": lambda d: pd.cut(d.hist_cod_orders, [-1, 0, 4, 19, 1e9], labels=["0 (new)", "1-4", "5-19", "20+"]),
-    "Has ever refused": lambda d: d.has_ever_refused.map({0: "No", 1: "Yes"}),
-    "Account age": lambda d: pd.cut(d.account_age_days, [-1, 29, 89, 364, 1e9], labels=["<30 days", "30-89", "90-364", "1 year+"]),
-    "Order hour": seg_hour,
-    "Value vs usual": lambda d: pd.cut(d.value_vs_aov, [0, 0.9999, 1.0001, 2, 3, 1e9], labels=["<1x", "1x (or new)", "1-2x", "2-3x", "3x+"]),
-    "Same item at other shops (48h)": lambda d: d.same_item_other_shops_48h.astype(str),
-    "Frequency change (30d)": lambda d: pd.cut(d.freq_change_ratio, [-1, 1, 3, 1e9], labels=["<1x", "1-3x", "3x+"]),
-    "Campaign day": lambda d: d.is_campaign_day.map({0: "No", 1: "Yes"}),
-    "Expected delivery days": lambda d: d.expected_days_to_delivery.astype(str),
-    "Condo with front office": lambda d: d.address_is_condo_with_office.map({0: "No", 1: "Yes"}),
-    "Order month": lambda d: d.order_month.map(lambda m: dt.date(2026, m, 1).strftime("%b")),
-    "Area courier failure rate": lambda d: pd.qcut(d.area_logistics_failure_rate.rank(method="first"), 4,
-                                                   labels=["lowest 25%", "2nd", "3rd", "highest 25%"]),
-    "Tier": lambda d: d.tier_name,
-    "Split": lambda d: d.split,
-}
+def share_label(v):
+    """A percentage label that never shows a non-empty share as 0.0%."""
+    return "<0.1%" if 0 < v < 0.05 else f"{v:.1f}%"
 
 
-def page_dashboard(d, params):
+def tier_card(k, g, total_orders):
+    """One tier's summary card: colour key, range, action, orders, share bar, risk and cost."""
+    n = int(g.loc[k, "orders"])
+    share = n / max(total_orders, 1)
+    risk = "-" if n == 0 else pct(g.loc[k, "predicted"], 2)
+    with st.container(border=True):
+        # Inner padding + clear gaps between the card's three parts (who / how many / what it costs)
+        st.markdown(
+            f"<div style='padding:6px 6px 4px'>"
+            f"<div style='height:6px;border-radius:3px;background:{TIER_COLORS[k]};margin-bottom:16px'></div>"
+            f"<div style='font-weight:700;font-size:17px;margin-bottom:4px'>{TIER_NAMES[k]}</div>"
+            f"<div style='opacity:.7;font-size:13px;line-height:1.55;min-height:42px'>"
+            f"Risk {TIER_RANGES[k]}<br>{TIER_ACTIONS[k]}</div>"
+            f"<div style='font-size:32px;font-weight:750;line-height:1.1;margin-top:18px'>{n:,}</div>"
+            f"<div style='opacity:.7;font-size:13px;margin-top:4px'>"
+            f"orders · {'<0.1%' if 0 < share < 0.001 else pct(share)} of all</div>"
+            f"<div style='height:6px;border-radius:3px;background:rgba(128,128,128,.2);margin:14px 0 18px'>"
+            f"<div style='height:6px;border-radius:3px;width:{max(share * 100, 0.5 if n else 0):.2f}%;"
+            f"background:{TIER_COLORS[k]}'></div></div>"
+            f"<div style='display:flex;justify-content:space-between;font-size:13px;line-height:1.9'>"
+            f"<span style='opacity:.7'>Mean predicted risk</span><b>{risk}</b></div>"
+            f"<div style='display:flex;justify-content:space-between;font-size:13px;line-height:1.9'>"
+            f"<span style='opacity:.7'>Predicted cost lost</span><b>{baht(g.loc[k, 'cost'])}</b></div>"
+            f"</div>",
+            unsafe_allow_html=True)
+
+
+def page_dashboard(df, params):
     st.title("COD Risk Score · Dashboard")
-    st.caption(NOTE + " Numbers below follow the sidebar filters.")
+    st.caption(note() + " Every number is the model's prediction and follows the filters below.")
+    d = dashboard_filters(df)
     if d.empty:
         st.warning("No orders match the filters.")
         return
-    in_sample_warning(d)
     dc = params["decision"]
-    y = d["label_failed"]
-    asked = d["tier"] >= 1
-    money = simulate(d["tier"], d["failure_type"], dc, {1: dc["catch_rate"]["tier1"], 2: dc["catch_rate"]["tier2"]},
-                     {1: dc["friction"]["tier1"], 2: dc["friction"]["tier2"]})
+    d = d.assign(cost=d["risk"] * cost_of_failure(d["order_value"]))
 
-    c = st.columns(6)
-    c[0].metric("Orders", f"{len(d):,}")
-    c[1].metric("Actual failure rate", pct(y.mean(), 2))
-    c[2].metric("Mean predicted risk", pct(d["risk"].mean(), 2), f"{(d['risk'].mean() - y.mean()) * 100:+.2f} pts vs actual",
-                delta_color="off")
-    c[3].metric("Orders asked (Tier 1+2)", pct(asked.mean()))
-    c[4].metric("Failures in Tier 1+2", pct(y[asked].sum() / max(y.sum(), 1)))
-    c[5].metric("Net value / 1,000 orders", f"฿{money['net'] / len(d) * 1000:,.0f}")
+    # ---- headline numbers ----
+    card = dict(border=True, height="stretch")
+    c = st.columns(3)
+    c[0].metric("Orders", f"{len(d):,}", **card, help="Number of COD orders matching the filters.")
+    c[1].metric("Mean predicted risk", pct(d["risk"].mean(), 2), **card,
+                help="Average of the model's predicted chance that an order fails.")
+    c[2].metric("Predicted cost lost", baht(d["cost"].sum()), **card,
+                help=f"Sum over orders of {COST_FORMULA}; about ฿{d['cost'].mean():,.2f} per order.")
 
-    left, right = st.columns([1.3, 1])
+    # ---- one card per tier ----
+    st.markdown("#### Tiers")
+    g = d.groupby("tier").agg(orders=("order_id", "size"), predicted=("risk", "mean"), cost=("cost", "sum"))
+    g = g.reindex(TIERS).fillna({"orders": 0, "cost": 0})
+    for col, k in zip(st.columns(4, gap="medium"), TIERS):
+        with col:
+            tier_card(k, g, len(d))
+
+    # ---- where the orders vs the cost sit; how risk is spread ----
+    left, right = st.columns(2)
     with left:
+        names = [TIER_NAMES[k] for k in TIERS]
+        so = g["orders"] / max(g["orders"].sum(), 1) * 100
+        sc = g["cost"] / max(g["cost"].sum(), 1e-9) * 100
+        fig = go.Figure([
+            go.Bar(y=names, x=so, name="Share of orders", orientation="h", marker_color=CONTEXT,
+                   text=[share_label(v) for v in so], textposition="outside",
+                   hovertemplate="%{y}<br>Share of orders: %{x:.1f}%<extra></extra>"),
+            go.Bar(y=names, x=sc, name="Share of predicted cost lost", orientation="h", marker_color=ACCENT,
+                   text=[share_label(v) for v in sc], textposition="outside",
+                   hovertemplate="%{y}<br>Share of predicted cost lost: %{x:.1f}%<extra></extra>")])
+        fig.update_layout(title="Share of orders vs share of predicted cost lost", barmode="group", bargroupgap=0.08,
+                          xaxis=dict(title="% of total", range=[0, 110], ticksuffix="%"),
+                          yaxis=dict(autorange="reversed", title=None),
+                          legend=dict(orientation="h", yanchor="top", y=-0.22, x=0))
+        show(fig, value_axis="x", bottom=110)
+    with right:
         h = d.assign(risk_shown=d["risk_pct"].clip(upper=30))
         fig = px.histogram(h, x="risk_shown", color="tier_name", nbins=120, color_discrete_map=TIER_COLOR_BY_NAME,
                            category_orders={"tier_name": list(TIER_NAMES.values())},
-                           labels={"risk_shown": "Risk score (%) (30+ grouped at 30)", "tier_name": "Tier"})
-        for cut in (dc["tier1_cutoff"], dc["tier2_cutoff"]):
-            fig.add_vline(x=cut * 100, line_dash="dash", line_color="#333",
-                          annotation_text=f"{cut:.1%}", annotation_position="top")
-        fig.update_layout(title="Risk score distribution", bargap=0.02, yaxis_title="Orders")
-        show(fig)
-    with right:
-        st.markdown("##### Tiers")
-        t = d.groupby("tier").agg(orders=("order_id", "size"), failures=("label_failed", "sum"),
-                                  actual=("label_failed", "mean"), predicted=("risk", "mean")).reindex([0, 1, 2]).fillna(0)
-        st.dataframe(pd.DataFrame({
-            "Tier": [TIER_NAMES[k] for k in t.index],
-            "Share of orders": (t["orders"] / t["orders"].sum()).map(pct),
-            "Share of failures": (t["failures"] / max(t["failures"].sum(), 1)).map(pct),
-            "Actual rate": t["actual"].map(lambda x: pct(x, 2)), "Mean predicted": t["predicted"].map(lambda x: pct(x, 2)),
-        }), hide_index=True, width="stretch")
-        mix = d[d["label_failed"] == 1].groupby(["tier_name", "outcome"]).size().reset_index(name="n")
-        mix["share"] = mix["n"] / mix.groupby("tier_name")["n"].transform("sum") * 100
-        fig = px.bar(mix, x="tier_name", y="share", color="outcome", color_discrete_map=OUTCOME_COLORS,
-                     category_orders={"tier_name": list(TIER_NAMES.values())}, hover_data={"n": True},
-                     labels={"tier_name": "", "share": "% of the tier's failures", "outcome": "Failure type"})
-        fig.update_layout(title="What kind of failures each tier holds")
-        show(fig, height=330)
+                           labels={"risk_shown": "Predicted risk (%), 30+ grouped at 30", "tier_name": "Tier"})
+        for cut in (TIER_CUTOFFS[2], TIER_CUTOFFS[3]):
+            fig.add_vline(x=cut * 100, line_width=1, line_color="rgba(128,128,128,.8)",
+                          annotation_text=f"{cut:.0%}", annotation_position="top")
+        fig.update_traces(hovertemplate="Risk %{x}%<br>%{y:,} orders<extra></extra>")
+        fig.update_layout(title="How predicted risk is spread", bargap=0.08, yaxis_title="Orders",
+                          legend=dict(orientation="h", yanchor="top", y=-0.22, x=0, title=None))
+        show(fig, bottom=110)
+        n4 = int(g.loc[4, "orders"])
+        st.caption(f"The Tier 4 cut-off ({TIER_CUTOFFS[4]:.0%}) is off this chart: {n4:,} order(s) are at or above it.")
 
-    left, right = st.columns(2)
-    with left:
-        s = d.sort_values("risk", ascending=False)
-        share_orders = np.arange(1, len(s) + 1) / len(s)
-        share_fail = s["label_failed"].cumsum().to_numpy() / max(s["label_failed"].sum(), 1)
-        idx = np.unique(np.linspace(0, len(s) - 1, 300).astype(int))
-        fig = go.Figure([go.Scatter(x=share_orders[idx] * 100, y=share_fail[idx] * 100, name="Model", line=dict(width=3)),
-                         go.Scatter(x=[0, 100], y=[0, 100], name="Random", line=dict(dash="dash", color="#999"))])
-        at30 = share_fail[max(int(len(s) * 0.3) - 1, 0)]
-        fig.add_annotation(x=30, y=at30 * 100, text=f"ask top 30% → find {at30:.0%} of failures", showarrow=True)
-        fig.update_layout(title="Capture curve: ask X% of orders, find Y% of failures",
-                          xaxis_title="% of orders asked (highest risk first)", yaxis_title="% of failures found")
-        show(fig)
-    with right:
-        g = d.assign(group=pd.qcut(d["risk"].rank(method="first"), min(10, len(d)), labels=False) + 1)
-        cal = g.groupby("group").agg(predicted=("risk", "mean"), actual=("label_failed", "mean"), n=("order_id", "size"))
-        top = max(cal["predicted"].max(), cal["actual"].max()) * 110
-        fig = go.Figure([go.Scatter(x=cal["predicted"] * 100, y=cal["actual"] * 100, mode="lines+markers",
-                                    name="Model", text=cal["n"], hovertemplate="pred %{x:.2f}%<br>actual %{y:.2f}%<br>%{text} orders"),
-                         go.Scatter(x=[0, top], y=[0, top], name="Perfect", line=dict(dash="dash", color="#999"))])
-        fig.update_layout(title="Calibration: predicted vs actual (10 groups)",
-                          xaxis_title="Predicted failure chance (%)", yaxis_title="Actual failure rate (%)")
-        show(fig)
-
-    st.subheader("Break down by segment")
-    seg_name = st.selectbox("Segment", list(SEGMENTS), key="seg_choice")
-    try:
-        seg_raw = SEGMENTS[seg_name](d)
-    except ValueError:
-        st.info("Not enough orders for this breakdown.")
-        return
-    if isinstance(seg_raw.dtype, pd.CategoricalDtype):
-        order = [str(x) for x in seg_raw.cat.categories]
-    elif seg_name == "Order hour":
-        order = ["01-04 (late night)", "05-11", "12-17", "18-00"]
-    elif seg_name == "Order month":
-        order = [dt.date(2026, m, 1).strftime("%b") for m in range(1, 13)]
+    # ---- trend ----
+    st.markdown("#### Trend")
+    c = st.columns([1, 1.6, 2])
+    freq = c[0].segmented_control("Group by", list(TREND_FREQ), default="Weekly", key="trend_freq") or "Weekly"
+    measure = c[1].segmented_control("Show", TREND_MEASURES, default=TREND_MEASURES[0], key="trend_measure") \
+        or TREND_MEASURES[0]
+    rule, unit = TREND_FREQ[freq]
+    t = d.set_index("order_datetime")
+    if measure == "Mean predicted risk":
+        w = t.resample(rule).agg({"risk": "mean", "order_id": "size"})
+        w = w[w["order_id"] > 0]
+        fig = go.Figure(go.Scatter(
+            x=w.index, y=w["risk"] * 100, mode="lines" if freq == "Daily" else "lines+markers",
+            line=dict(color=ACCENT, width=2), marker=dict(size=8), customdata=w["order_id"],
+            hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}%<br>%{customdata:,} orders<extra></extra>"))
+        fig.update_layout(title=f"Mean predicted risk per {unit}", yaxis_title="Predicted risk (%)", hovermode="x")
+        table = w.rename(columns={"risk": "Mean predicted risk", "order_id": "Orders"})
     else:
-        order = sorted(seg_raw.astype(str).unique(), key=lambda x: (len(x), x))
-    sg = d.assign(segment=seg_raw.astype(str)).groupby("segment").agg(
-        orders=("order_id", "size"), actual=("label_failed", "mean"), predicted=("risk", "mean"),
-        asked=("tier", lambda x: (x >= 1).mean()))
-    sg = sg.reindex([o for o in order if o in sg.index])
-    left, right = st.columns([1.4, 1])
-    with left:
-        long = sg.reset_index().melt(id_vars="segment", value_vars=["actual", "predicted"], var_name="rate", value_name="v")
-        fig = px.bar(long, x="segment", y=long["v"] * 100, color="rate", barmode="group",
-                     color_discrete_map={"actual": "#1d2330", "predicted": "#ee4d2d"},
-                     labels={"y": "Failure rate (%)", "segment": seg_name})
-        fig.update_layout(title=f"Failure rate by segment ({seg_name}): actual vs predicted")
-        show(fig)
-    with right:
-        st.dataframe(pd.DataFrame({"Segment": sg.index, "Orders": sg["orders"].map("{:,}".format),
-                                   "Actual rate": sg["actual"].map(lambda x: pct(x, 2)),
-                                   "Predicted": sg["predicted"].map(lambda x: pct(x, 2)),
-                                   "Asked (Tier 1+2)": sg["asked"].map(pct)}), hide_index=True, width="stretch")
-
-    st.subheader("Areas: buyer problems vs courier problems")
-    st.caption("A good score should flag buyer behaviour, not a poor courier network. The last column shows how often "
-               "buyers with a CLEAN record (5+ past orders, no refusals or misses) still get asked to confirm.")
-    clean = (d["hist_cod_orders"] >= 5) & (d["hist_refusals"] == 0) & (d["hist_buyer_caused_misses"] == 0)
-    a = d.assign(wont=d.failure_type.eq("wont"), cant=d.failure_type.eq("cant"), logi=d.failure_type.eq("logistics"),
-                 clean_asked=np.where(clean, d["tier"] >= 1, np.nan))
-    ar = a.groupby("area_id").agg(orders=("order_id", "size"), actual=("label_failed", "mean"), wont=("wont", "mean"),
-                                  cant=("cant", "mean"), logistics=("logi", "mean"), predicted=("risk", "mean"),
-                                  area_rate=("area_logistics_failure_rate", "mean"), clean_asked=("clean_asked", "mean"))
-    left, right = st.columns([1, 1.2])
-    with left:
-        fig = px.scatter(ar.reset_index(), x=ar["area_rate"] * 100, y=ar["clean_asked"] * 100, size="orders",
-                         hover_name="area_id", labels={"x": "Area courier failure rate (%)", "y": "% of clean buyers asked"})
-        fig.update_layout(title="Fairness check: are clean buyers in poor courier areas asked more?")
-        show(fig)
-    with right:
-        st.dataframe(pd.DataFrame({
-            "Area": ar.index, "Orders": ar["orders"], "Failure rate": ar["actual"].map(lambda x: pct(x, 2)),
-            "Won't": ar["wont"].map(lambda x: pct(x, 2)), "Can't": ar["cant"].map(lambda x: pct(x, 2)),
-            "Logistics": ar["logistics"].map(lambda x: pct(x, 2)), "Predicted": ar["predicted"].map(lambda x: pct(x, 2)),
-            "Clean buyers asked": ar["clean_asked"].map(lambda x: "-" if pd.isna(x) else pct(x))}),
-            hide_index=True, width="stretch", height=380)
-
-    st.subheader("Weekly trend")
-    w = d.set_index("order_datetime").resample("W").agg({"label_failed": "mean", "risk": "mean", "order_id": "size"})
-    w = w[w["order_id"] > 0]
-    fig = go.Figure([go.Scatter(x=w.index, y=w["label_failed"] * 100, name="Actual", mode="lines+markers",
-                                line=dict(color="#9aa0a6")),
-                     go.Scatter(x=w.index, y=w["risk"] * 100, name="Predicted", mode="lines+markers",
-                                line=dict(color="#ee4d2d", width=3))])
-    fig.update_layout(title="Failure rate per week: actual vs predicted (a growing gap = the model needs a refresh)",
-                      yaxis_title="Failure rate (%)")
-    show(fig, height=340)
+        col, agg = ("cost", "sum") if measure == "Predicted cost lost" else ("order_id", "size")
+        w = t.groupby([pd.Grouper(freq=rule), "tier"])[col].agg(agg).unstack("tier").reindex(columns=TIERS).fillna(0)
+        w = w[w.sum(axis=1) > 0]
+        fig = go.Figure([go.Bar(x=w.index, y=w[k], name=TIER_NAMES[k], marker_color=TIER_COLORS[k],
+                                hovertemplate=f"%{{x|%Y-%m-%d}}<br>{TIER_NAMES[k]}: "
+                                              + ("฿%{y:,.0f}" if col == "cost" else "%{y:,}") + "<extra></extra>")
+                         for k in TIERS])
+        fig.update_layout(title=f"{measure} per {unit}, by tier", barmode="stack", bargap=0.15,
+                          yaxis_title="฿" if col == "cost" else "Orders",
+                          legend=dict(orientation="h", yanchor="top", y=-0.15, x=0))
+        table = w.rename(columns=TIER_NAMES)
+    show(fig, height=400, bottom=90)
+    with st.expander("Trend data as a table"):
+        st.dataframe(table.reset_index().rename(columns={"order_datetime": unit.title()}), hide_index=True,
+                     width="stretch")
 
 
 # ---------------------------------------------------------------------------
 # Page: Orders
 # ---------------------------------------------------------------------------
-def page_orders(d, all_orders, params, model):
+def page_orders(all_orders, params, model):
     st.title("COD Risk Score · Orders")
-    st.caption(NOTE + " Click a row to see that order in full. Click a column header to sort.")
-    in_sample_warning(d)
+    st.caption(note() + " Filter the orders, then click a row to see that order in full. Click a column header to sort.")
+    d = orders_filter_panel(all_orders)
     if d.empty:
         st.warning("No orders match the filters.")
         return
     view = d.sort_values("risk", ascending=False)[[
-        "order_id", "order_datetime", "buyer_id", "area_id", "risk_pct", "tier_name", "outcome", "order_value",
+        "order_id", "order_datetime", "buyer_id", "area_id", "risk_pct", "tier_name", "order_value",
         "value_vs_aov", "hist_cod_orders", "hist_refusals", "account_age_days", "order_hour", "same_item_other_shops_48h",
         "is_campaign_day", "expected_days_to_delivery", "split"]]
     event = st.dataframe(
@@ -451,7 +496,7 @@ def page_orders(d, all_orders, params, model):
             "buyer_id": st.column_config.NumberColumn("Buyer", format="%d"),
             "area_id": st.column_config.NumberColumn("Area", format="%d"),
             "risk_pct": st.column_config.ProgressColumn("Risk", format="%.1f%%", min_value=0, max_value=40),
-            "tier_name": "Tier", "outcome": "Actual outcome",
+            "tier_name": "Tier",
             "order_value": st.column_config.NumberColumn("Value (฿)", format="%d"),
             "value_vs_aov": st.column_config.NumberColumn("vs usual", format="%.1fx"),
             "hist_cod_orders": "Past orders", "hist_refusals": "Refusals", "account_age_days": "Account age (d)",
@@ -476,8 +521,15 @@ def page_orders(d, all_orders, params, model):
              "Past refusals": int(r.hist_refusals), "Same item at other shops (48h)": int(r.same_item_other_shops_48h),
              "Expected delivery": f"{int(r.expected_days_to_delivery)} days", "Split": r.split}
     st.markdown(" · ".join(f"**{k}:** {v}" for k, v in facts.items()))
-    order_view(r[model.features], int(r.order_hour), model, params,
-               extra={"outcome": r.outcome, "p_true": r.p_true})
+    p, tier, reasons, phi = score_order(r[model.features], int(r.order_hour), model)
+    left, mid, right = st.columns([1.1, 1.3, 0.9])
+    with left:
+        score_block(p, tier, reasons, params)
+    with mid:
+        factor_chart(phi, model)
+    with right:
+        st.markdown("##### What the buyer sees")
+        st.markdown(phone_html(tier, float(r.order_value)), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -490,9 +542,21 @@ INPUT_DEFAULTS = {
     "in_orders_90": 4, "in_refusals_90": 0, "in_usual": 450.0, "in_transit": 0, "in_last30": 1,
     "in_days_first": 300.0,
 }
+PRESETS = {
+    "Typical buyer": {},
+    "New buyer": {"in_value": 1200, "in_account_age": 20, "in_past": 0, "in_orders_90": 0, "in_usual": 0.0,
+                  "in_last30": 0, "in_days_first": 0.0},
+    "Past refuser": {"in_value": 1800, "in_past": 10, "in_refusals": 4, "in_last_refusal": 10, "in_orders_90": 4,
+                     "in_refusals_90": 2},
+}
 
 
-def load_order_into_form(all_orders, params):
+def apply_preset(name):
+    st.session_state.update({**INPUT_DEFAULTS, **PRESETS[name]})
+    st.session_state["in_load_msg"] = f"Form set to: {name}."
+
+
+def load_order_into_form(all_orders):
     oid = st.session_state.get("in_load_id")
     row = all_orders[all_orders["order_id"] == oid]
     if row.empty:
@@ -511,70 +575,20 @@ def load_order_into_form(all_orders, params):
         "in_transit": int(r.orders_in_transit), "in_last30": int(r.orders_last_30d),
         "in_days_first": float(round(r.days_since_first_cod, 2)),
     })
-    st.session_state["in_load_msg"] = (f"Loaded order {oid} (model score in the table: {r.risk:.2%}, "
-                                       f"actual outcome: {r.outcome}).")
-
-
-def reset_form():
-    st.session_state.update(INPUT_DEFAULTS)
-    st.session_state["in_load_msg"] = "Form reset to a typical buyer."
+    st.session_state["in_load_msg"] = f"Loaded order {oid} (score in the Orders table: {r.risk:.2%})."
 
 
 def set_area_rate(params):
     st.session_state["in_area_rate"] = params["area_latest_rate"][str(st.session_state["in_area"])]
 
 
-def page_score(all_orders, params, model):
-    st.title("COD Risk Score · Score an order")
-    st.caption(NOTE + " Type what the platform knows at checkout. The app builds the 20 model features "
-               "the same way as the training pipeline and scores the order live.")
-    for k, v in INPUT_DEFAULTS.items():
-        st.session_state.setdefault(k, v)
+def field(widget, label, desc, **kw):
+    """An input with a short description underneath."""
+    widget(label, **kw)
+    st.caption(desc)
 
-    c1, c2, c3 = st.columns([1, 1, 2])
-    st.session_state.setdefault("in_load_id", int(all_orders["order_id"].iloc[0]))
-    c1.number_input("Load an existing order ID", min_value=1, step=1, key="in_load_id")
-    c2.button("Load into form", on_click=load_order_into_form, args=(all_orders, params), width="stretch")
-    c2.button("Reset to a typical buyer", on_click=reset_form, width="stretch")
-    if st.session_state.get("in_load_msg"):
-        c3.info(st.session_state["in_load_msg"])
 
-    st.markdown("#### 1. This order")
-    a = st.columns(5)
-    a[0].number_input("Order value (฿)", min_value=1, max_value=200_000, step=50, key="in_value")
-    a[1].date_input("Order date", min_value=dt.date(2025, 1, 1), max_value=dt.date(2027, 12, 31), key="in_date")
-    a[2].number_input("Order hour (0-23)", min_value=0, max_value=23, step=1, key="in_hour")
-    a[3].number_input("Same item ordered with COD at other shops (48h)", min_value=0, max_value=10, step=1, key="in_same_item")
-    a[4].number_input("Expected delivery days", min_value=1, max_value=6, step=1, key="in_days")
-
-    st.markdown("#### 2. Buyer and address")
-    b = st.columns(5)
-    b[0].number_input("Account age (days)", min_value=0, max_value=10_000, step=1, key="in_account_age")
-    b[1].selectbox("Area", list(range(1, 61)), key="in_area", on_change=set_area_rate, args=(params,))
-    b[2].number_input("Area courier failure rate (last 90 days)", min_value=0.0, max_value=0.2, step=0.0005,
-                      format="%.4f", key="in_area_rate", help="Filled in from the area's latest rate; you can override it.")
-    b[3].checkbox("Condo with a front office", key="in_condo")
-
-    st.markdown("#### 3. Buyer's COD history (orders whose outcome is known)")
-    h = st.columns(5)
-    h[0].number_input("Past COD orders", min_value=0, max_value=1000, step=1, key="in_past")
-    h[1].number_input("Of which refused at the door", min_value=0, max_value=1000, step=1, key="in_refusals")
-    h[2].number_input("Days since last refusal", min_value=0, max_value=5000, step=1, key="in_last_refusal",
-                      disabled=st.session_state["in_refusals"] == 0)
-    h[3].number_input("Of which 'not home / no cash'", min_value=0, max_value=1000, step=1, key="in_not_home")
-    h[4].number_input("Of which courier failures", min_value=0, max_value=1000, step=1, key="in_courier")
-    h2 = st.columns(5)
-    h2[0].number_input("Past orders known in the last 90 days", min_value=0, max_value=1000, step=1, key="in_orders_90")
-    h2[1].number_input("Refusals in the last 90 days", min_value=0, max_value=1000, step=1, key="in_refusals_90")
-    h2[2].number_input("Buyer's usual order value (฿, 0 = none)", min_value=0.0, max_value=200_000.0, step=10.0,
-                       key="in_usual")
-    h2[3].number_input("COD orders placed in the last 30 days", min_value=0, max_value=500, step=1, key="in_last30")
-    h2[4].number_input("Days since first COD order", min_value=0.0, max_value=5000.0, step=1.0, key="in_days_first")
-    with st.expander("Advanced"):
-        st.number_input("Earlier orders still in transit (outcome not known yet)", min_value=0, max_value=100, step=1,
-                        key="in_transit", help="They count for 'value vs usual' and 'frequency', not for refusal history.")
-
-    s = st.session_state
+def form_errors(s):
     errors = []
     if s.in_refusals + s.in_not_home + s.in_courier > s.in_past:
         errors.append("Refusals + 'not home' misses + courier failures cannot be more than past COD orders.")
@@ -594,176 +608,721 @@ def page_score(all_orders, params, model):
         errors.append("A buyer with earlier orders needs a usual order value.")
     if s.in_days_first > s.in_account_age + 1:
         errors.append("The first COD order cannot be before the account was created.")
-    if errors:
-        for e in errors:
-            st.error(e)
-        return
+    return errors
 
-    raw = pd.DataFrame([{
-        "past_orders": s.in_past, "past_refusals": s.in_refusals, "orders_last_90d": s.in_orders_90,
-        "refusals_last_90d": s.in_refusals_90, "days_since_last_refusal": s.in_last_refusal,
-        "past_not_home": s.in_not_home, "past_courier_failures": s.in_courier, "order_value": s.in_value,
-        "usual_order_value": s.in_usual, "orders_in_transit": s.in_transit, "orders_last_30d": s.in_last30,
-        "days_since_first_cod": s.in_days_first, "account_age_days": s.in_account_age,
-        "order_datetime": dt.datetime.combine(s.in_date, dt.time(s.in_hour)), "order_hour": s.in_hour,
-        "same_item_other_shops": s.in_same_item, "delivery_days": s.in_days,
-        "condo_with_office": int(s.in_condo), "area_logistics_failure_rate": s.in_area_rate}])
-    feats = features_from_inputs(raw, params["feature_settings"]).iloc[0]
-    notes = []
-    if feats["is_campaign_day"]:
-        notes.append(f"{s.in_date.day}.{s.in_date.month} is a campaign day")
-    if feats["same_item_other_shops_48h"] > 3:
-        notes.append("the training data had at most 3 other shops, so scores this far out are extrapolated")
-    if s.in_date.year != 2026 or not 2 <= s.in_date.month <= 7:
-        notes.append("the model only saw Feb-Jul 2026 orders; other months are extrapolated")
+
+def page_score(all_orders, params, model):
+    st.title("COD Risk Score · Score an order")
+    st.caption(note() + " Fill in what the platform knows at checkout. The score on the right updates as you type.")
+    for k, v in INPUT_DEFAULTS.items():
+        st.session_state.setdefault(k, v)
+    st.session_state.setdefault("in_load_id", int(all_orders["order_id"].iloc[0]))
+
+    with st.container(border=True):
+        st.markdown("**Start from an example**, then change any field below.")
+        c = st.columns([1, 1, 1, 0.3, 1.2, 1])
+        for col, name in zip(c[:3], PRESETS):
+            col.button(name, on_click=apply_preset, args=(name,), width="stretch")
+        c[4].number_input("Order ID", min_value=1, step=1, key="in_load_id", label_visibility="collapsed")
+        c[5].button("Load this order", on_click=load_order_into_form, args=(all_orders,), width="stretch")
+        if st.session_state.get("in_load_msg"):
+            st.caption(st.session_state["in_load_msg"])
+
+    form, result = st.columns([1.5, 1], gap="large")
+    with form:
+        t1, t2, t3 = st.tabs(["1 · This order", "2 · Buyer & address", "3 · COD history"])
+        with t1:
+            a, b = st.columns(2)
+            with a:
+                field(st.number_input, "Order value (฿)", "Total price of this order, paid in cash at the door.",
+                      min_value=1, max_value=200_000, step=50, key="in_value")
+                field(st.number_input, "Order hour (0-23)", "Hour of checkout. 01:00-04:59 counts as late night.",
+                      min_value=0, max_value=23, step=1, key="in_hour")
+                field(st.number_input, "Expected delivery days", "Delivery time promised at checkout (1-6 days).",
+                      min_value=1, max_value=6, step=1, key="in_days")
+            with b:
+                field(st.date_input, "Order date",
+                      "Day of the order. Days like 7.7 or 11.11 count as campaign days. The model saw Feb-Jul 2026.",
+                      min_value=dt.date(2025, 1, 1), max_value=dt.date(2027, 12, 31), key="in_date")
+                field(st.number_input, "Same item at other shops (48h)",
+                      "How many OTHER shops this buyer ordered the same item from with COD in the last 48 hours.",
+                      min_value=0, max_value=10, step=1, key="in_same_item")
+        with t2:
+            a, b = st.columns(2)
+            with a:
+                field(st.number_input, "Account age (days)", "Days since the buyer's account was created.",
+                      min_value=0, max_value=10_000, step=1, key="in_account_age")
+                field(st.checkbox, "Condo with a front office",
+                      "Tick if building staff can receive the parcel when the buyer is out.", key="in_condo")
+            with b:
+                field(st.selectbox, "Area", "Delivery area 1-60 (synthetic). Picking one fills in its courier failure rate.",
+                      options=list(range(1, 61)), key="in_area", on_change=set_area_rate, args=(params,))
+                field(st.number_input, "Area courier failure rate (last 90 days)",
+                      "Share of this area's orders that failed because of the courier. 0.0015 = 0.15%.",
+                      min_value=0.0, max_value=0.2, step=0.0005, format="%.4f", key="in_area_rate")
+        with t3:
+            st.caption("Count only earlier COD orders whose result is already known (delivered or failed).")
+            a, b = st.columns(2)
+            with a:
+                field(st.number_input, "Past COD orders", "All earlier COD orders with a known result. 0 = first COD order.",
+                      min_value=0, max_value=1000, step=1, key="in_past")
+                field(st.number_input, "Refused at the door", "Of those, how many the buyer refused to accept.",
+                      min_value=0, max_value=1000, step=1, key="in_refusals")
+                field(st.number_input, "Not home / no cash", "Of those, how many failed because the buyer was out or had no cash.",
+                      min_value=0, max_value=1000, step=1, key="in_not_home")
+                field(st.number_input, "Courier failures", "Of those, how many failed because of the courier. Not held against the buyer.",
+                      min_value=0, max_value=1000, step=1, key="in_courier")
+                field(st.number_input, "Buyer's usual order value (฿)", "The buyer's typical order size. 0 if they have never ordered.",
+                      min_value=0.0, max_value=200_000.0, step=10.0, key="in_usual")
+            with b:
+                field(st.number_input, "Days since last refusal", "Only used if the buyer has refused before.",
+                      min_value=0, max_value=5000, step=1, key="in_last_refusal", disabled=st.session_state["in_refusals"] == 0)
+                field(st.number_input, "Past orders in the last 90 days", "Earlier COD orders (known result) from the last 90 days.",
+                      min_value=0, max_value=1000, step=1, key="in_orders_90")
+                field(st.number_input, "Refusals in the last 90 days", "Refusals among those last-90-day orders.",
+                      min_value=0, max_value=1000, step=1, key="in_refusals_90")
+                field(st.number_input, "COD orders in the last 30 days", "Orders placed in the last 30 days, including ones still on the way.",
+                      min_value=0, max_value=500, step=1, key="in_last30")
+                field(st.number_input, "Days since first COD order", "How long the buyer has used COD. 0 if this is the first.",
+                      min_value=0.0, max_value=5000.0, step=1.0, key="in_days_first")
+            with st.expander("Advanced"):
+                field(st.number_input, "Earlier orders still on the way",
+                      "Outcome not known yet. They count for 'value vs usual' and 'frequency', not for refusals.",
+                      min_value=0, max_value=100, step=1, key="in_transit")
+
+    s = st.session_state
+    with result:
+        errors = form_errors(s)
+        if errors:
+            st.markdown("##### Please fix the form")
+            for e in errors:
+                st.error(e)
+            return
+        raw = pd.DataFrame([{
+            "past_orders": s.in_past, "past_refusals": s.in_refusals, "orders_last_90d": s.in_orders_90,
+            "refusals_last_90d": s.in_refusals_90, "days_since_last_refusal": s.in_last_refusal,
+            "past_not_home": s.in_not_home, "past_courier_failures": s.in_courier, "order_value": s.in_value,
+            "usual_order_value": s.in_usual, "orders_in_transit": s.in_transit, "orders_last_30d": s.in_last30,
+            "days_since_first_cod": s.in_days_first, "account_age_days": s.in_account_age,
+            "order_datetime": dt.datetime.combine(s.in_date, dt.time(s.in_hour)), "order_hour": s.in_hour,
+            "same_item_other_shops": s.in_same_item, "delivery_days": s.in_days,
+            "condo_with_office": int(s.in_condo), "area_logistics_failure_rate": s.in_area_rate}])
+        feats = features_from_inputs(raw, params["feature_settings"]).iloc[0]
+        p, tier, reasons, phi = score_order(feats, s.in_hour, model)
+        score_block(p, tier, reasons, params)
+        notes = []
+        if feats["is_campaign_day"]:
+            notes.append(f"{s.in_date.day}.{s.in_date.month} is a campaign day")
+        if feats["same_item_other_shops_48h"] > 3:
+            notes.append("the training data had at most 3 other shops, so this score is extrapolated")
+        if s.in_date.year != 2026 or not 2 <= s.in_date.month <= 7:
+            notes.append("the model only saw Feb-Jul 2026 orders; other months are extrapolated")
+        if notes:
+            st.caption("Note: " + "; ".join(notes) + ".")
+
     st.divider()
-    if notes:
-        st.caption("Note: " + "; ".join(notes) + ".")
-    order_view(feats, s.in_hour, model, params)
+    left, right = st.columns([1.6, 1])
+    with left:
+        factor_chart(phi, model)
+    with right:
+        st.markdown("##### What the buyer sees")
+        st.markdown(phone_html(tier, float(s.in_value)), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
 # Page: Policy simulator
 # ---------------------------------------------------------------------------
-SIM_KEYS = ["sim_t1", "sim_t2", "sim_c1", "sim_c2", "sim_deliv", "sim_f1", "sim_f2", "sim_msg"]
-
-
 def sim_defaults(dc):
-    return {"sim_t1": dc["tier1_cutoff"] * 100, "sim_t2": dc["tier2_cutoff"] * 100,
-            "sim_c1": dc["catch_rate"]["tier1"] * 100, "sim_c2": dc["catch_rate"]["tier2"] * 100,
-            "sim_deliv": dc["caught_become_delivered"] * 100, "sim_f1": dc["friction"]["tier1"] * 100,
-            "sim_f2": dc["friction"]["tier2"] * 100, "sim_msg": dc["message_cost_thb"]}
+    out = {f"sim_cut{k}": round(TIER_CUTOFFS[k] * 100, 4) for k in (2, 3, 4)}
+    for k in TIERS:
+        out[f"sim_catch{k}"] = round(SIM_DEFAULTS["catch"][k] * 100, 4)
+        out[f"sim_fric{k}"] = round(SIM_DEFAULTS["friction"][k] * 100, 4)
+    out.update({"sim_deliv": round(dc["caught_become_delivered"] * 100, 4), "sim_msg": dc["message_cost_thb"]})
+    return out
 
 
-def page_simulator(d_filtered, all_orders, params):
+def page_simulator(all_orders, params):
     st.title("COD Risk Score · Policy simulator")
-    st.caption(NOTE + " Move the cut-offs and assumptions; every number is recomputed. "
-               "Money uses expected values, the same model as reports/decision_report.md.")
+    st.caption(note() + " Move the cut-offs and assumptions; every number is recomputed from the model's predicted risk. "
+               "Catch rates and friction are assumptions, not measurements. "
+               f"A failed order costs {COST_FORMULA.replace(' × predicted risk', '')}.")
     dc = params["decision"]
     for k, v in sim_defaults(dc).items():
         st.session_state.setdefault(k, v)
 
-    scope = st.radio("Orders to simulate on", ["July test set (matches the report)", "Orders matching the sidebar filters"],
-                     horizontal=True, key="sim_scope")
-    d = all_orders[all_orders["split"] == "test"] if scope.startswith("July") else d_filtered
+    has_test = bool((all_orders["split"] == "test").any())
+    first = "July test set" if has_test else "All imported orders"
+    scope = st.radio("Orders to simulate on", [first, "Orders matching the Orders-page filters"],
+                     horizontal=True, key="sim_scope_" + ("demo" if has_test else "imported"))
+    if scope == first:
+        d = all_orders[all_orders["split"] == "test"] if has_test else all_orders
+    else:
+        d, texts = apply_filters(all_orders, ORDERS_ALL_FILTERS, "f_")
+        st.caption(f"{len(d):,} orders · " + ("; ".join(texts) if texts else "no filters set on the Orders page"))
     if d.empty:
         st.warning("No orders to simulate.")
         return
 
+    st.markdown("##### Tier cut-offs (predicted risk %)")
+    c = st.columns(3)
+    c[0].slider("Tier 2 starts at", 0.5, 10.0, step=0.1, key="sim_cut2")
+    c[1].slider("Tier 3 starts at", 2.0, 50.0, step=0.5, key="sim_cut3")
+    c[2].slider("Tier 4 starts at", 20.0, 99.0, step=1.0, key="sim_cut4")
+
+    st.markdown("##### What each tier's action does")
     c = st.columns(4)
-    c[0].slider("Tier 1 cut-off (risk %)", 0.5, 10.0, step=0.1, key="sim_t1")
-    c[1].slider("Tier 2 cut-off (risk %)", 2.0, 40.0, step=0.5, key="sim_t2")
-    c[2].slider("Tier 1 catch rate (% of refusals stopped)", 0.0, 100.0, step=5.0, key="sim_c1")
-    c[3].slider("Tier 2 catch rate", 0.0, 100.0, step=5.0, key="sim_c2")
-    c = st.columns(4)
-    c[0].slider("Caught orders that end up delivered (%)", 0.0, 100.0, step=5.0, key="sim_deliv")
-    c[1].slider("Tier 1 friction (% good orders lost)", 0.0, 3.0, step=0.1, key="sim_f1")
-    c[2].slider("Tier 2 friction", 0.0, 5.0, step=0.1, key="sim_f2")
-    c[3].slider("Message cost per asked order (฿)", 0.0, 1.0, step=0.05, key="sim_msg")
-    if st.button("Back to the report's assumptions"):
+    for col, k in zip(c, TIERS):
+        with col:
+            st.markdown(f"**{TIER_NAMES[k]}**  \n<span style='opacity:.65;font-size:13px'>{TIER_ACTIONS[k]}</span>",
+                        unsafe_allow_html=True)
+            st.slider("Failures prevented (%)", 0.0, 100.0, step=5.0, key=f"sim_catch{k}")
+            st.slider("Good orders lost (%)", 0.0, 30.0, step=0.5, key=f"sim_fric{k}")
+    c = st.columns(3)
+    c[0].slider("Prevented orders that end up delivered (%)", 0.0, 100.0, step=5.0, key="sim_deliv",
+                help="The rest are cancelled before shipping: no shipping cost, but no commission either.")
+    c[1].slider("Message cost per order (฿)", 0.0, 1.0, step=0.05, key="sim_msg",
+                help="Every tier sends at least one message (reminder, confirmation, deposit or payment request).")
+    if c[2].button("Back to the default assumptions"):
         st.session_state.update(sim_defaults(dc))
         st.rerun()
-    s = st.session_state
-    if s.sim_t2 <= s.sim_t1:
-        st.error("The Tier 2 cut-off must be above the Tier 1 cut-off.")
-        return
 
-    dcx = {**dc, "tier1_cutoff": s.sim_t1 / 100, "tier2_cutoff": s.sim_t2 / 100,
-           "caught_become_delivered": s.sim_deliv / 100, "message_cost_thb": s.sim_msg}
-    catch, fric = {1: s.sim_c1 / 100, 2: s.sim_c2 / 100}, {1: s.sim_f1 / 100, 2: s.sim_f2 / 100}
-    tier = assign_tiers(d["risk"].to_numpy(), dcx)
-    ft, y = d["failure_type"].to_numpy(), d["label_failed"].to_numpy()
-    yearly = dc["yearly_orders_total"] * dc["cod_share"]
+    s = st.session_state
+    if not s.sim_cut2 < s.sim_cut3 < s.sim_cut4:
+        st.error("The cut-offs must go up: Tier 2 < Tier 3 < Tier 4.")
+        return
+    cuts = {k: s[f"sim_cut{k}"] / 100 for k in (2, 3, 4)}
+    catch = {k: s[f"sim_catch{k}"] / 100 for k in TIERS}
+    fric = {k: s[f"sim_fric{k}"] / 100 for k in TIERS}
+    dcx = {**dc, "caught_become_delivered": s.sim_deliv / 100, "message_cost_thb": s.sim_msg}
+
+    risk = d["risk"].to_numpy()
+    tier = assign_tiers(risk, cuts)
     n = len(d)
-    pol = {"Do nothing": simulate(np.zeros(n, int), ft, dcx, catch, fric),
-           "Ask everyone": simulate(np.ones(n, int), ft, dcx, catch, fric),
-           "Our tiers": simulate(tier, ft, dcx, catch, fric)}
+    yearly = dc["yearly_orders_total"] * dc["cod_share"]
+    per_year = lambda x: x / n * yearly  # noqa: E731
+    value = d["order_value"].to_numpy()
+    pol = {"Do nothing": simulate(np.zeros(n, int), risk, value, dcx, catch, fric),
+           "Confirm everyone (Tier 2 action)": simulate(np.full(n, 2), risk, value, dcx, catch, fric),
+           "Our tiers": simulate(tier, risk, value, dcx, catch, fric)}
+    cost_lost = (risk * cost_of_failure(value)).sum()
 
     k = st.columns(4)
-    k[0].metric("Orders asked (our tiers)", pct(pol["Our tiers"]["asked_share"]))
-    k[1].metric("Net per year: our tiers", f"฿{pol['Our tiers']['net'] / n * yearly / 1e6:,.1f}M")
-    k[2].metric("Net per year: ask everyone", f"฿{pol['Ask everyone']['net'] / n * yearly / 1e6:,.1f}M")
-    diff = (pol["Our tiers"]["net"] - pol["Ask everyone"]["net"]) / n * yearly
-    k[3].metric("Our tiers vs ask everyone", f"{'+' if diff >= 0 else '-'}฿{abs(diff) / 1e6:,.1f}M / year")
+    k[0].metric("Predicted cost lost / year (no action)", baht(per_year(cost_lost)), border=True)
+    k[1].metric("Net saving / year: our tiers", baht(per_year(pol["Our tiers"]["net"])), border=True)
+    k[2].metric("Net saving / year: confirm everyone", baht(per_year(pol["Confirm everyone (Tier 2 action)"]["net"])),
+                border=True)
+    diff = per_year(pol["Our tiers"]["net"] - pol["Confirm everyone (Tier 2 action)"]["net"])
+    k[3].metric("Our tiers vs confirm everyone", f"{'+' if diff >= 0 else '-'}{baht(abs(diff))} / year", border=True)
 
     left, right = st.columns([1, 1.3])
     with left:
         st.markdown("##### Tier shape")
         st.dataframe(pd.DataFrame({
-            "Tier": [TIER_NAMES[t] for t in (0, 1, 2)],
-            "Share of orders": [pct((tier == t).mean()) for t in (0, 1, 2)],
-            "Share of failures": [pct(y[tier == t].sum() / max(y.sum(), 1)) for t in (0, 1, 2)],
-            "Actual rate": [pct(y[tier == t].mean(), 2) if (tier == t).any() else "-" for t in (0, 1, 2)]}),
+            "Tier": [TIER_NAMES[t] for t in TIERS],
+            "Share of orders": [pct((tier == t).mean()) for t in TIERS],
+            "Share of predicted failures": [pct(risk[tier == t].sum() / risk.sum()) for t in TIERS],
+            "Mean predicted risk": [pct(risk[tier == t].mean(), 2) if (tier == t).any() else "-" for t in TIERS]}),
             hide_index=True, width="stretch")
         st.markdown("##### Three policies (per 1,000 orders, ฿)")
         st.dataframe(pd.DataFrame([{
-            "Policy": name, "Net per year (฿M)": round(r["net"] / n * yearly / 1e6, 1), "Net": round(r["net"] / n * 1000, 1),
-            "Asked": pct(r["asked_share"], 0), "Failures avoided": round(r["failures_avoided"] / n * 1000, 2),
+            "Policy": name, "Net per year (฿M)": round(per_year(r["net"]) / 1e6, 1), "Net": round(r["net"] / n * 1000, 1),
+            "Failures prevented": round(r["failures_prevented"] / n * 1000, 2),
             "Shipping saved": round(r["shipping_saved"] / n * 1000, 1),
             "Commission won back": round(r["commission_won_back"] / n * 1000, 1),
-            "Lost to friction": -round(r["commission_lost_friction"] / n * 1000, 1),
-            "Messages": -round(r["message_cost"] / n * 1000, 1)} for name, r in pol.items()]),
+            "Lost to friction": -round(r["commission_lost_friction"] / n * 1000, 1) + 0.0,
+            "Messages": -round(r["message_cost"] / n * 1000, 1) + 0.0} for name, r in pol.items()]),
             hide_index=True, width="stretch")
     with right:
-        grid = np.round(np.arange(0.5, min(s.sim_t2, 10.0) + 0.001, 0.25), 2)
-        nets = [simulate(assign_tiers(d["risk"].to_numpy(), {**dcx, "tier1_cutoff": g / 100}), ft, dcx, catch, fric)["net"]
-                / n * yearly / 1e6 for g in grid]
-        fig = go.Figure(go.Scatter(x=grid, y=nets, mode="lines", line=dict(width=3), name="Our tiers"))
-        fig.add_hline(y=pol["Ask everyone"]["net"] / n * yearly / 1e6, line_dash="dash", line_color="#999",
-                      annotation_text="Ask everyone")
-        fig.add_vline(x=s.sim_t1, line_dash="dot", annotation_text=f"current {s.sim_t1:.1f}%")
+        grid = np.round(np.arange(0.5, min(s.sim_cut3, 10.0) + 0.001, 0.25), 2)
+        nets = [per_year(simulate(assign_tiers(risk, {**cuts, 2: g / 100}), risk, value, dcx, catch, fric)["net"]) / 1e6
+                for g in grid]
+        fig = go.Figure(go.Scatter(x=grid, y=nets, mode="lines", line=dict(width=2, color=ACCENT), name="Our tiers"))
+        fig.add_hline(y=per_year(pol["Confirm everyone (Tier 2 action)"]["net"]) / 1e6, line_dash="dash",
+                      line_color="#999", annotation_text="Confirm everyone")
+        fig.add_vline(x=s.sim_cut2, line_dash="dot", annotation_text=f"current {s.sim_cut2:.1f}%")
         best = grid[int(np.argmax(nets))]
-        fig.update_layout(title=f"Net value per year vs Tier 1 cut-off (best here: {best:.2f}%)",
-                          xaxis_title="Tier 1 cut-off (risk %)", yaxis_title="฿ million per year")
+        fig.update_layout(title=f"Net saving per year vs Tier 2 cut-off (best here: {best:.2f}%)",
+                          xaxis_title="Tier 2 cut-off (risk %)", yaxis_title="฿ million per year")
         show(fig)
 
-    st.markdown("##### Sensitivity: net per year (฿M) for our tiers, by Tier 1 catch rate and friction "
-                "(Tier 2 keeps its gap: catch +{:.0f} pts, friction x{:.1f})".format(
-                    s.sim_c2 - s.sim_c1, (s.sim_f2 / s.sim_f1) if s.sim_f1 else 1))
+    st.markdown("##### Sensitivity: net saving per year (฿M) for our tiers, by Tier 2 assumptions")
     rows = []
-    for cr in (25, 40, 50):
-        row = {"Tier 1 catch rate": f"{cr}%"}
+    for cr in (15, 25, 35):
+        row = {"Tier 2 failures prevented": f"{cr}%"}
         for fr in (0.3, 0.5, 1.0):
-            ratio = (s.sim_f2 / s.sim_f1) if s.sim_f1 else 1
-            r = simulate(tier, ft, dcx, {1: cr / 100, 2: min(cr + s.sim_c2 - s.sim_c1, 100) / 100},
-                         {1: fr / 100, 2: fr * ratio / 100})
-            e = simulate(np.ones(n, int), ft, dcx, {1: cr / 100, 2: cr / 100}, {1: fr / 100, 2: fr / 100})
-            row[f"friction {fr}%"] = f"{r['net'] / n * yearly / 1e6:,.1f} (vs {e['net'] / n * yearly / 1e6:,.1f})"
+            c2, f2 = {**catch, 2: cr / 100}, {**fric, 2: fr / 100}
+            r = simulate(tier, risk, value, dcx, c2, f2)
+            e = simulate(np.full(n, 2), risk, value, dcx, c2, f2)
+            row[f"Tier 2 good orders lost {fr}%"] = f"{per_year(r['net']) / 1e6:,.1f} (vs {per_year(e['net']) / 1e6:,.1f})"
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("Each cell: our tiers (vs ask everyone). Yearly scale: "
+    st.caption("Each cell: our tiers (vs confirm everyone). Other tiers keep the values above. Yearly scale: "
                f"{dc['yearly_orders_total'] / 1e6:,.1f}M orders x {dc['cod_share']:.0%} COD = {yearly / 1e6:,.1f}M COD orders.")
+
+
+# ---------------------------------------------------------------------------
+# Page: Model performance (predicted risk vs what actually happened)
+# ---------------------------------------------------------------------------
+SPLIT_COLORS = {"Test": ACCENT, "Train": CONTEXT}
+
+
+def table_height(rows):
+    """Height that shows every row of a dataframe without empty space (header + rows)."""
+    return 38 + 35 * rows
+
+
+def what_is_compared(text):
+    """A small note under each section saying exactly which data is compared."""
+    st.caption("ℹ️ " + text)
+
+
+def page_performance(demo):
+    st.title("COD Risk Score · Model performance")
+    st.caption(DEMO_NOTE + " How well the model's predicted risk matches what actually happened to each order.")
+    if st.session_state.get("active_source") == IMPORTED:
+        st.info("Imported files have no actual outcomes, so this page always uses the demo data.", icon="ℹ️")
+
+    with st.container(border=True):
+        st.markdown("**What this page compares**")
+        st.markdown(
+            "- **Predicted** = the model's risk score: the calibrated Logistic Regression used everywhere in this app.\n"
+            "- **Actual** = whether the order really failed in the synthetic data (refused, not home / no cash, or a "
+            "courier problem). The model never sees this when it scores an order.\n"
+            "- **Train** = Feb–Jun 2026 orders the model learned from (the first 80% to fit it, the last 20% to "
+            "choose settings and calibrate). **Test** = Jul 2026 orders it never saw: the honest numbers.\n"
+            "- If Test is about as good as Train, the model has not just memorised its training data.")
+
+    splits = {"Train": demo[demo["split"] == "train"], "Test": demo[demo["split"] == "test"]}
+    sm = {k: pf.summary(v) for k, v in splits.items()}
+
+    # ---- headline numbers: Test, with the change from Train ----
+    st.markdown("#### Headline numbers")
+    cards = [("AUC", "AUC", lambda v: f"{v:.3f}", "How well risk ranks failures above deliveries. 0.5 = random, 1 = perfect."),
+             ("Top 30% capture", "Top 30% capture", pct, "Share of all failures found when the 30% riskiest orders are asked."),
+             ("Top 5% capture", "Top 5% capture", pct, "Share of all failures found in the 5% riskiest orders."),
+             ("Brier score", "Brier score", lambda v: f"{v:.4f}", "Mean squared gap between predicted risk and the 0/1 outcome. Lower is better."),
+             ("Actual failure rate", None, None, "Share of test orders that really failed vs the model's average predicted risk.")]
+    cols = st.columns(len(cards))
+    for col, (label, key, fmt, helptext) in zip(cols, cards):
+        if key is None:
+            col.metric(f"{label} (test)", pct(sm["Test"]["Actual failure rate"], 2),
+                       f"predicted {pct(sm['Test']['Mean predicted risk'], 2)}",
+                       delta_color="off", delta_arrow="off", border=True, help=helptext, height="stretch")
+            continue
+        t, r = sm["Test"][key], sm["Train"][key]
+        gap = f"{abs(t - r) * 100:.1f} pts" if fmt is pct else fmt(abs(t - r))  # % metrics: percentage points
+        col.metric(f"{label} (test)", fmt(t), f"{'+' if t - r >= 0 else '-'}{gap} vs train ({fmt(r)})",
+                   delta_color="inverse" if key == "Brier score" else "normal", border=True, help=helptext, height="stretch")
+    what_is_compared("Big numbers = Test (Jul 2026, never seen in training). The small line = the change from Train "
+                     "(Feb–Jun 2026). Actual = real outcome in the synthetic data; predicted = model risk.")
+
+    left, right = st.columns([1.15, 1], gap="large")
+    with left:
+        st.markdown("##### Train vs test, all numbers")
+        rows = []
+        for name in sm["Test"]:
+            fmt = (lambda v: f"{v:,}") if name in ("Orders", "Failures") else \
+                (lambda v: f"{v:.3f}") if name == "AUC" else (lambda v: f"{v:.4f}") if "Brier" in name else \
+                (lambda v: f"{v:.1f}x") if "x average" in name else (lambda v: pct(v, 2))
+            rows.append({"Metric": name, "Train (Feb–Jun)": fmt(sm["Train"][name]), "Test (Jul)": fmt(sm["Test"][name])})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=table_height(len(rows)),
+                     column_config={"Metric": st.column_config.TextColumn(width="large")})
+    with right:
+        st.markdown("##### Actual vs predicted, by tier")
+        trows = []
+        for name, d in splits.items():
+            g = d.groupby("tier").agg(orders=("order_id", "size"), actual=("label_failed", "mean"),
+                                      predicted=("risk", "mean"), fails=("label_failed", "sum")).reindex(TIERS)
+            for k in TIERS:
+                if pd.isna(g.loc[k, "orders"]):
+                    continue
+                trows.append({"Data": name, "Tier": TIER_NAMES[k], "Orders": f"{int(g.loc[k, 'orders']):,}",
+                              "Actual rate": pct(g.loc[k, "actual"], 2), "Predicted": pct(g.loc[k, "predicted"], 2),
+                              "Share of failures": pct(g.loc[k, "fails"] / max(d["label_failed"].sum(), 1))})
+        st.dataframe(pd.DataFrame(trows), hide_index=True, width="stretch", height=table_height(len(trows)))
+    what_is_compared("Each tier: the actual failure rate of its orders vs the average risk the model gave them, "
+                     "for Train and for Test. Close numbers = the % on screen can be trusted.")
+
+    # ---- accuracy charts ----
+    st.markdown("#### How accurate is the risk score?")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1:
+        fig = go.Figure()
+        top = 0
+        for name in ("Train", "Test"):
+            cal = pf.calibration(splits[name]["label_failed"], splits[name]["risk"])
+            top = max(top, cal["predicted"].max(), cal["actual"].max())
+            fig.add_scatter(x=cal["predicted"] * 100, y=cal["actual"] * 100, mode="lines+markers", name=name,
+                            line=dict(color=SPLIT_COLORS[name], width=2), marker=dict(size=8),
+                            customdata=cal["orders"], hovertemplate="predicted %{x:.2f}%<br>actual %{y:.2f}%<br>"
+                                                                    "%{customdata:,} orders<extra>" + name + "</extra>")
+        fig.add_scatter(x=[0, top * 110], y=[0, top * 110], mode="lines", name="Perfect",
+                        line=dict(color="#55555c", width=1, dash="dash"), hoverinfo="skip")
+        fig.update_layout(title="Calibration", xaxis_title="Predicted risk (%)", yaxis_title="Actual failure rate (%)",
+                          legend=dict(orientation="h", yanchor="top", y=-0.22, x=0))
+        show(fig, height=400, bottom=110, subtitle=DEMO_NOTE)
+        what_is_compared("Orders split into 10 equal groups by predicted risk; each dot = the group's average "
+                         "predicted risk vs its actual failure rate. On the dashed line = predicted % is right.")
+    with c2:
+        fig = go.Figure()
+        for name in ("Train", "Test"):
+            x, y = pf.capture_points(splits[name]["label_failed"], splits[name]["risk"])
+            fig.add_scatter(x=x * 100, y=y * 100, mode="lines", name=name, line=dict(color=SPLIT_COLORS[name], width=2),
+                            hovertemplate="ask top %{x:.0f}%<br>find %{y:.1f}% of failures<extra>" + name + "</extra>")
+        fig.add_scatter(x=[0, 100], y=[0, 100], mode="lines", name="Random", hoverinfo="skip",
+                        line=dict(color="#55555c", width=1, dash="dash"))
+        fig.add_vline(x=30, line_width=1, line_color="#55555c")
+        fig.update_layout(title="Capture curve", xaxis_title="% of orders asked (riskiest first)",
+                          yaxis_title="% of failures found", legend=dict(orientation="h", yanchor="top", y=-0.22, x=0))
+        show(fig, height=400, bottom=110, subtitle=DEMO_NOTE)
+        what_is_compared(f"Asking the riskiest orders first, how many actual failures are found. At 30%: "
+                         f"Test {pct(sm['Test']['Top 30% capture'])}, Train {pct(sm['Train']['Top 30% capture'])}.")
+    with c3:
+        fig = go.Figure()
+        for name in ("Train", "Test"):
+            x, y = pf.roc_points(splits[name]["label_failed"], splits[name]["risk"])
+            fig.add_scatter(x=x * 100, y=y * 100, mode="lines", name=f"{name} (AUC {sm[name]['AUC']:.3f})",
+                            line=dict(color=SPLIT_COLORS[name], width=2),
+                            hovertemplate="false alarms %{x:.1f}%<br>failures caught %{y:.1f}%<extra>" + name + "</extra>")
+        fig.add_scatter(x=[0, 100], y=[0, 100], mode="lines", name="Random", hoverinfo="skip",
+                        line=dict(color="#55555c", width=1, dash="dash"))
+        fig.update_layout(title="ROC curve", xaxis_title="% of delivered orders flagged",
+                          yaxis_title="% of failed orders flagged", legend=dict(orientation="h", yanchor="top", y=-0.22, x=0))
+        show(fig, height=400, bottom=110, subtitle=DEMO_NOTE)
+        what_is_compared("Every possible cut-off: share of actually failed orders flagged vs share of actually "
+                         "delivered orders flagged by mistake. The further above the dashed line, the better.")
+
+    # ---- over time and by group ----
+    st.markdown("#### Over time and by group")
+    w = demo.set_index("order_datetime").resample("W").agg({"label_failed": "mean", "risk": "mean", "order_id": "size"})
+    w = w[w["order_id"] > 0]
+    fig = go.Figure([
+        go.Scatter(x=w.index, y=w["label_failed"] * 100, name="Actual", mode="lines+markers",
+                   line=dict(color=CONTEXT, width=2), marker=dict(size=6),
+                   hovertemplate="%{x|%Y-%m-%d}<br>actual %{y:.2f}%<extra></extra>"),
+        go.Scatter(x=w.index, y=w["risk"] * 100, name="Predicted", mode="lines+markers",
+                   line=dict(color=ACCENT, width=2), marker=dict(size=6),
+                   hovertemplate="%{x|%Y-%m-%d}<br>predicted %{y:.2f}%<extra></extra>")])
+    test_start = splits["Test"]["order_datetime"].min()
+    fig.add_vrect(x0=test_start, x1=w.index.max() + pd.Timedelta(days=3), fillcolor=ACCENT, opacity=0.08, line_width=0,
+                  annotation_text="Test (Jul)", annotation_position="top left")
+    fig.update_layout(title="Failure rate per week: actual vs predicted", yaxis_title="Failure rate (%)", hovermode="x",
+                      legend=dict(orientation="h", yanchor="top", y=-0.15, x=0))
+    show(fig, height=380, bottom=90, subtitle=DEMO_NOTE)
+    what_is_compared("Every week from Feb to Jul 2026: actual failure rate vs the model's average predicted risk. "
+                     "The shaded part is the Test month. A gap that keeps growing would mean the model needs retraining.")
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("##### New vs returning COD buyers")
+        rows = []
+        for name, d in splits.items():
+            for label, part in (("New (first COD order)", d[d["is_new_cod_buyer"] == 1]),
+                                ("Returning", d[d["is_new_cod_buyer"] == 0])):
+                y, p = part["label_failed"], part["risk"]
+                rows.append({"Data": name, "Buyers": label, "Orders": f"{len(part):,}",
+                             "Actual rate": pct(y.mean(), 2), "Predicted": pct(p.mean(), 2),
+                             "AUC": f"{pf.auc(y, p):.3f}", "Top 30% capture": pct(pf.capture_at(y.to_numpy(), p.to_numpy(), 0.3))})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        what_is_compared("Each group ranked on its own. New buyers have no history at all, so the model can only "
+                         "use the order itself (value, time, other shops, area): lower AUC is expected.")
+    with right:
+        st.markdown("##### Which failures land in the riskiest 30%")
+        rows = []
+        for name, d in splits.items():
+            top = d["risk"] >= d["risk"].quantile(0.70)
+            for ft, label in pf.FAILURE_TYPES.items():
+                is_ft = d["failure_type"] == ft
+                rows.append({"Data": name, "Failure type": label, "Failures": int(is_ft.sum()),
+                             "caught": (top & is_ft).sum() / max(is_ft.sum(), 1) * 100})
+        ft = pd.DataFrame(rows)
+        fig = go.Figure([go.Bar(y=ft[ft["Data"] == name]["Failure type"], x=ft[ft["Data"] == name]["caught"],
+                                name=name, orientation="h", marker_color=SPLIT_COLORS[name],
+                                text=[f"{v:.0f}%" for v in ft[ft["Data"] == name]["caught"]], textposition="outside",
+                                customdata=ft[ft["Data"] == name]["Failures"],
+                                hovertemplate="%{y}<br>%{x:.1f}% of %{customdata:,} caught<extra>" + name + "</extra>")
+                         for name in ("Train", "Test")])
+        fig.update_layout(title="% of each failure type in the riskiest 30% of orders", barmode="group",
+                          xaxis=dict(title="% caught", range=[0, 100], ticksuffix="%"), yaxis=dict(title=None, autorange="reversed"),
+                          legend=dict(orientation="h", yanchor="top", y=-0.25, x=0))
+        show(fig, height=330, bottom=100, value_axis="x", subtitle=DEMO_NOTE)
+        what_is_compared("Refusals (won't) are what the tiers try to stop, so they should be caught most. Courier "
+                         "problems are not the buyer's fault and depend on the area, so a low share there is fine.")
+
+    # ---- why Logistic Regression, not LightGBM ----
+    st.markdown("#### Logistic Regression vs LightGBM")
+    trials, s, rec = pf.training_record()
+    left, right = st.columns([1.3, 1], gap="large")
+    with left:
+        fig = go.Figure(go.Bar(
+            y=[f"{m} · {st_}" for m, st_ in zip(trials["Model"], trials["Setting"])], x=trials["Validation AUC"],
+            orientation="h", marker_color=[ACCENT if m.startswith("Logistic") else CONTEXT for m in trials["Model"]],
+            text=[f"{v:.4f}" for v in trials["Validation AUC"]], textposition="outside",
+            hovertemplate="%{y}<br>validation AUC %{x:.4f}<extra></extra>"))
+        lo = trials["Validation AUC"].min()
+        fig.update_layout(title="Validation AUC during training", xaxis=dict(title="AUC", range=[lo - 0.02, trials["Validation AUC"].max() + 0.02]),
+                          yaxis=dict(title=None, autorange="reversed"), showlegend=False)
+        show(fig, height=330, value_axis="x", subtitle=DEMO_NOTE)
+        what_is_compared(f"Validation = the last 20% of the training period ({s['valid_rows']:,} orders from "
+                         f"{s['valid_from'][:10]}), used to pick LightGBM's settings. Test data was not used here.")
+    with right:
+        st.success(f"**Used in the app: {rec['name']}.** {rec['reason']}")
+    table = pf.report_test_table()
+    if table is not None:
+        st.markdown("##### Both models on the test set")
+        st.dataframe(table, hide_index=True, width="stretch", height=table_height(len(table)),
+                     column_config={"Metric (test set)": st.column_config.TextColumn(width="large")})
+        what_is_compared("Both models on the Test set (Jul 2026), from the training pipeline's report "
+                         "(cod_risk_demo/reports/model_report.md).")
+
+
+# ---------------------------------------------------------------------------
+# Page: Import data (+ the check pop-up)
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="Reading and checking the file ...", max_entries=3)
+def analyse_file(name, data, area_rates_json):
+    t0 = time.perf_counter()
+    raw = importer.read_file(name, data)
+    t1 = time.perf_counter()
+    report = importer.check(raw, json.loads(area_rates_json))
+    report["timing"] = {"read": t1 - t0, "check": time.perf_counter() - t1}
+    return report
+
+
+def secs(s):
+    return f"{s * 1000:.0f} ms" if s < 1 else f"{s:.2f} s"
+
+
+@st.cache_data(max_entries=1)
+def template_files(examples):
+    return importer.template_csv(examples), importer.template_excel(examples)
+
+
+def completeness_table(report):
+    """Per template column: present in the file? how many rows are filled / blank / unreadable."""
+    raw, t, rows = report["raw"], report["table"], []
+    for col, kind, required, _, _ in importer.TEMPLATE:
+        if col not in raw.columns:
+            rows.append({"Column": col, "Required": "yes" if required else "no", "In file": "missing",
+                         "Filled": 0, "Blank": report["rows"], "Unreadable": 0})
+            continue
+        blank = int(importer._blank(raw[col]).sum())
+        filled = int(t[col].notna().sum())
+        rows.append({"Column": col, "Required": "yes" if required else "no", "In file": "yes",
+                     "Filled": filled, "Blank": blank, "Unreadable": report["rows"] - filled - blank})
+    out = pd.DataFrame(rows)
+    share = out["Filled"] / max(report["rows"], 1) * 100
+    out["Complete"] = [f"{v:.0f}%" if v == 100 else f"{min(v, 99.99):.2f}%" for v in share]  # never round up to 100%
+    return out
+
+
+@st.dialog("Check the imported file", width="large")
+def import_check_dialog(name, report, params, model):
+    n, bad = report["rows"], int(report["bad"].sum())
+    noted_rows = pd.Series(False, index=report["bad"].index)
+    for m in report["warnings"].values():
+        noted_rows |= m
+    noted = int((noted_rows & ~report["bad"]).sum())
+    st.markdown(f"**{name}** · {n:,} rows · {len(report['raw'].columns)} columns")
+
+    if report["missing_cols"]:
+        st.error("The file is missing required column(s): **" + ", ".join(report["missing_cols"]) +
+                 "**. Add them (see the template) and upload the file again.")
+    c = st.columns(4)
+    c[0].metric("Rows in file", f"{n:,}", border=True)
+    c[1].metric("Ready to import", f"{n - bad:,}", border=True)
+    c[2].metric("Rows with problems", f"{bad:,}", border=True, help="These rows are not imported.")
+    c[3].metric("Rows with notes", f"{noted:,}", border=True, help="Imported and scored, but worth a look.")
+    if report["extra_cols"]:
+        st.caption("Columns not in the template are ignored: " + ", ".join(report["extra_cols"]))
+    tm = report.get("timing")
+    if tm:
+        st.caption(f"Read the file in {secs(tm['read'])}, checked {n:,} rows in {secs(tm['check'])}.")
+
+    t1, t2, t3 = st.tabs(["Column completeness", "Checks", f"Problem rows ({bad:,})"])
+    with t1:
+        st.dataframe(completeness_table(report), hide_index=True, width="stretch", height=300)
+    with t2:
+        summary = importer.summary_table(report)
+        if summary.empty:
+            st.success("Every row passed every check.")
+        else:
+            st.dataframe(summary, hide_index=True, width="stretch")
+    with t3:
+        if bad == 0:
+            st.success("No problem rows.")
+        else:
+            rows = importer.problem_rows(report)
+            st.dataframe(rows.head(importer.MAX_ERRORS_SHOWN), hide_index=True, width="stretch", height=260)
+            if bad > importer.MAX_ERRORS_SHOWN:
+                st.caption(f"Showing the first {importer.MAX_ERRORS_SHOWN:,}; download the file for all {bad:,}.")
+            st.download_button("Download problem rows (CSV)", rows.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="import_problems.csv", mime="text/csv")
+
+    a, b = st.columns(2)
+    ready = n - bad
+    label = f"Import {ready:,} row(s)" + (f", skip {bad:,}" if bad and ready else "")
+    if a.button(label, type="primary", disabled=ready == 0 or bool(report["missing_cols"]), width="stretch"):
+        with st.spinner("Scoring the orders ..."):
+            t0 = time.perf_counter()
+            scored = importer.score(report, params, model)
+            score_s = time.perf_counter() - t0
+        st.session_state["imported"] = {"df": scored, "name": name, "rows": n, "skipped": bad,
+                                        "at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                        "timing": {**report.get("timing", {}), "score": score_s}}
+        st.session_state["switch_source"] = IMPORTED
+        st.rerun()
+    if b.button("Cancel", width="stretch"):
+        st.rerun()
+
+
+def page_import(params, model, demo):
+    st.title("COD Risk Score · Import data")
+    st.caption(note() + " Upload your own orders (CSV or Excel). The app checks the file, builds the 20 model "
+               "features and scores every order; all pages can then show them.")
+
+    st.markdown("#### 1 · Get the template")
+    csv_bytes, xlsx_bytes = template_files(importer.demo_as_template(demo, 100))
+    c = st.columns([1, 1, 3])
+    c[0].download_button("Template (Excel)", xlsx_bytes, file_name="cod_orders_template.xlsx", width="stretch",
+                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    c[1].download_button("Template (CSV)", csv_bytes, file_name="cod_orders_template.csv", mime="text/csv",
+                         width="stretch")
+    c[2].caption("One row per COD order, with what the platform knows at checkout. Both files hold 100 example "
+                 "rows from the demo data; replace them with yours. The Excel file also has a 'columns' sheet.")
+    with st.expander("What each column means"):
+        st.dataframe(importer.column_guide(), hide_index=True, width="stretch")
+        st.caption("History counts only earlier orders whose result was already known at checkout. "
+                   "The courier failure rate counts only courier-caused failures in the area over the last 90 days.")
+
+    st.markdown("#### 2 · Upload your file")
+    up = st.file_uploader("CSV or Excel (.xlsx)", type=["csv", "xlsx", "xlsm"], key="import_file")
+    if up is not None:
+        try:
+            report = analyse_file(up.name, up.getvalue(), json.dumps(params["area_latest_rate"]))
+        except ValueError as e:
+            st.error(str(e))
+            report = None
+        except Exception as e:  # unreadable file
+            st.error(f"Could not read the file: {e}")
+            report = None
+        if report is not None:
+            st.session_state["import_report"] = (up.name, report)
+            if st.session_state.get("import_checked") != up.file_id:  # open the pop-up once per new file
+                st.session_state["import_checked"] = up.file_id
+                import_check_dialog(up.name, report, params, model)
+    if st.session_state.get("import_report") and up is not None:
+        name, report = st.session_state["import_report"]
+        if st.button("Review the check again"):
+            import_check_dialog(name, report, params, model)
+
+    st.markdown("#### 3 · Imported data")
+    imp = st.session_state.get("imported")
+    if not imp:
+        st.info("Nothing imported yet. The pages show the demo data.")
+        return
+    d = imp["df"]
+    st.success(f"**{imp['name']}** imported at {imp['at']}: {len(d):,} orders scored"
+               + (f", {imp['skipped']:,} row(s) skipped." if imp["skipped"] else "."))
+    c = st.columns(4)
+    c[0].metric("Orders", f"{len(d):,}", border=True)
+    c[1].metric("Mean predicted risk", pct(d["risk"].mean(), 2), border=True)
+    for col, k in zip(c[2:], (3, 4)):
+        col.metric(f"{TIER_NAMES[k]}", f"{int((d['tier'] == k).sum()):,}", border=True)
+
+    tm = imp.get("timing", {})
+    if "score" in tm:
+        st.markdown("##### Processing time")
+        total = tm.get("read", 0) + tm.get("check", 0) + tm["score"]
+        c = st.columns(5)
+        c[0].metric("Read file", secs(tm.get("read", 0)), border=True)
+        c[1].metric("Check rows", secs(tm.get("check", 0)), border=True,
+                    help=f"Checked all {imp['rows']:,} rows in the file.")
+        c[2].metric("Model scoring", secs(tm["score"]), border=True,
+                    help="Builds the 20 features and computes risk, tier and reasons for every imported order.")
+        c[3].metric("Total", secs(total), border=True)
+        c[4].metric("Speed (orders / second)", f"{len(d) / max(total, 1e-9):,.0f}", border=True,
+                    help=f"End to end. Model scoring alone: {len(d) / max(tm['score'], 1e-9):,.0f} orders/s.")
+        st.caption("Measured on this computer when the file was imported. If the same file was checked "
+                   "before, the read and check times shown are from that first check.")
+    out = d[["order_id", "buyer_id", "order_datetime", "area_id", "order_value", "risk", "tier"]].assign(
+        tier_name=d["tier_name"], action=d["tier"].map(TIER_ACTIONS))
+    c = st.columns([1, 1, 3])
+    c[0].download_button("Download scores (CSV)", out.to_csv(index=False).encode("utf-8-sig"),
+                         file_name="cod_orders_scored.csv", mime="text/csv", width="stretch")
+    if c[1].button("Remove imported data", width="stretch"):
+        st.session_state.pop("imported", None)
+        st.session_state["switch_source"] = DEMO
+        st.rerun()
+    c[2].caption("Pick **Imported file** under *Data* in the sidebar to see these orders on every page.")
 
 
 # ---------------------------------------------------------------------------
 # Entry point (called from app.py)
 # ---------------------------------------------------------------------------
+LAYOUT_CSS = """
+<style>
+/* Content: centred, never wider than 1440px, less empty space above the title */
+[data-testid="stMainBlockContainer"], .block-container {max-width: 1440px; margin: 0 auto;
+    padding-top: 2.2rem; padding-bottom: 3rem; padding-left: 2.5rem; padding-right: 2.5rem}
+[data-testid="stSidebarContent"] [data-testid="stHeading"] h1 {color: #f47b20}
+/* Orange rule under each page title */
+[data-testid="stMainBlockContainer"] h1 {padding-bottom: .35rem; border-bottom: 3px solid #f47b20; margin-bottom: .4rem}
+[data-testid="stMetricLabel"] p {font-size: 0.95rem; color: #b8b8be}
+</style>"""
+
+
 def render():
+    st.markdown(LAYOUT_CSS, unsafe_allow_html=True)
     if not (APP_DATA / "orders.csv").exists():
         st.error("App data not found. Run `python -m src.export_app` inside cod_risk_demo/ "
                  "(or run_all.bat) first.")
         return
     # Keep filter / form values when switching pages (Streamlit drops state of hidden widgets).
     for k in list(st.session_state.keys()):
-        if k.startswith(("f_", "in_", "sim_")) and not k.startswith("in_load_msg"):
+        if k.startswith(("f_", "fd_", "in_", "sim_")) and not k.startswith("in_load_msg"):
             st.session_state[k] = st.session_state[k]
 
-    params, df = load()
+    params, demo = load()
     model = get_model(json.dumps(params))
 
     st.sidebar.title("COD Risk Score")
-    st.sidebar.caption("ML model (calibrated Logistic Regression) · " + NOTE)
-    # Direct links: ?system=ml&page=dashboard|orders|score|simulator
-    wanted = {"dashboard": 0, "orders": 1, "score": 2, "simulator": 3}.get(st.query_params.get("page", ""), 0)
+    st.sidebar.caption("ML model (calibrated Logistic Regression), trained on synthetic data. Not Shopee data.")
+    # Direct links: ?page=dashboard|orders|score|simulator|performance|import
+    wanted = {"dashboard": 0, "orders": 1, "score": 2, "simulator": 3, "performance": 4, "import": 5}.get(st.query_params.get("page", ""), 0)
     page = st.sidebar.radio("Page", PAGES, index=wanted, key="risk_page")
+    df = data_source_picker(demo)
 
     if page == "Score an order":
         page_score(df, params, model)
-        return
-    d = filter_panel(df)
-    if page == "Dashboard":
-        page_dashboard(d, params)
+    elif page == "Dashboard":  # draws its own filter row
+        page_dashboard(df, params)
     elif page == "Orders":
-        page_orders(d, df, params, model)
+        page_orders(df, params, model)
+    elif page == "Policy simulator":
+        page_simulator(df, params)
+    elif page == "Model performance":  # needs actual outcomes, so always the demo data
+        page_performance(demo)
     else:
-        page_simulator(d, df, params)
+        page_import(params, model, demo)
+
+
+def data_source_picker(demo):
+    """Sidebar choice between the demo orders and an imported file. Returns the orders to show."""
+    imp = st.session_state.get("imported")
+    if "switch_source" in st.session_state:  # set by the import pop-up / remove button before the rerun
+        st.session_state["data_source"] = st.session_state.pop("switch_source")
+    if not imp:
+        st.session_state["data_source"] = DEMO
+    st.sidebar.radio("Data", [DEMO, IMPORTED] if imp else [DEMO], key="data_source",
+                     captions=[f"{len(demo):,} synthetic orders"]
+                     + ([f"{imp['name']} · {len(imp['df']):,} orders"] if imp else []))
+    source = st.session_state["data_source"]
+    if st.session_state.get("active_source") != source:  # filter ranges and choices come from the data: start fresh
+        if "active_source" in st.session_state:
+            for prefix in ("f_", "fd_"):
+                reset_filters(prefix)
+            st.session_state.pop("orders_table", None)
+            st.session_state.pop("in_load_id", None)
+        st.session_state["active_source"] = source
+    return imp["df"] if source == IMPORTED and imp else demo

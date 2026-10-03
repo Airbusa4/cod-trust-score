@@ -1,0 +1,24 @@
+# Black / orange / white theme for the COD Risk Score app (always dark, whatever the device setting).
+[theme]
+base = "dark"
+primaryColor = "#f47b20"
+backgroundColor = "#0b0b0c"
+secondaryBackgroundColor = "#18181b"
+textColor = "#f5f5f5"
+borderColor = "#2c2c31"
+dataframeBorderColor = "#2c2c31"
+dataframeHeaderBackgroundColor = "#141416"
+linkColor = "#ff9a4d"
+baseRadius = "0.6rem"
+baseFontSize = 16
+# Compact headings (h1..h6), large readable numbers
+headingFontSizes = ["2rem", "1.45rem", "1.2rem", "1.05rem", "1rem", "0.9rem"]
+headingFontWeights = [750, 700, 650, 600, 600, 600]
+metricValueFontSize = "2.3rem"
+metricValueFontWeight = 700
+chartCategoricalColors = ["#f47b20", "#9a9aa0", "#ffb069", "#c25e17", "#8c4614"]
+
+[theme.sidebar]
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#141416"
+borderColor = "#2c2c31"

@@ -10,11 +10,24 @@ import calendar
 import numpy as np
 import pandas as pd
 
-TIER_ACTIONS = {0: "Nothing extra", 1: "One-tap \"Confirm to Ship\"", 2: "Confirm + choose prepaid, deposit or call"}
-TIER_NAMES = {0: "Tier 0 · Low risk", 1: "Tier 1 · Confirm", 2: "Tier 2 · High risk"}
-TIER_COLORS = {0: "#1e8e3e", 1: "#c77700", 2: "#d93025"}
-OUTCOME_NAMES = {"none": "Delivered", "wont": "Refused (won't)", "cant": "Not home / no cash (can't)",
-                 "logistics": "Courier problem (logistics)"}
+TIERS = (1, 2, 3, 4)
+# Lowest risk that puts an order in each tier (Tier 1 is everything below 3%).
+TIER_CUTOFFS = {2: 0.03, 3: 0.10, 4: 0.77}
+TIER_ACTIONS = {1: "Normal COD + COD Reminder", 2: "COD Confirmation + Order Hold",
+                3: "Refundable Deposit 10%", 4: "COD → Prepaid Requirement"}
+TIER_NAMES = {1: "Tier 1 · Normal COD", 2: "Tier 2 · Confirm & hold", 3: "Tier 3 · Deposit", 4: "Tier 4 · Prepaid only"}
+# Tiers are ordered, so one hue (orange) in monotone steps: higher risk = darker
+# (checked: monotone, distinct steps, the darkest step still clears 2:1 on the black background).
+TIER_COLORS = {1: "#ffb069", 2: "#f47b20", 3: "#c25e17", 4: "#8c4614"}
+TIER_TEXT_ON = {1: "#0b0b0c", 2: "#0b0b0c", 3: "#ffffff", 4: "#ffffff"}  # readable text on each tier color
+TIER_RANGES = {1: "below 3%", 2: "3% to 10%", 3: "10% to 77%", 4: "77% and above"}
+DEPOSIT_SHARE = 0.10
+
+# Policy simulator starting values. ASSUMPTIONS, not measured: adjust them in the app.
+# catch = share of predicted failures the tier's action prevents;
+# friction = share of good orders lost because of the extra step.
+SIM_DEFAULTS = {"catch": {1: 0.05, 2: 0.25, 3: 0.50, 4: 0.90},
+                "friction": {1: 0.0, 2: 0.005, 3: 0.03, 4: 0.15}}
 
 NICE_NAMES = {
     "hist_cod_orders": "Past COD orders",
@@ -128,8 +141,26 @@ class Model:
         return self.a * self.coef * (self._z(X) - self.bg)
 
 
-def assign_tiers(p, dc):
-    return np.select([p >= dc["tier2_cutoff"], p >= dc["tier1_cutoff"]], [2, 1], 0)
+def assign_tiers(p, cutoffs=TIER_CUTOFFS):
+    p = np.asarray(p)
+    return np.select([p >= cutoffs[4], p >= cutoffs[3], p >= cutoffs[2]], [4, 3, 2], 1)
+
+
+# Money lost when a COD order fails (THB): shipping out + shipping back + the commission on the order.
+SHIP_OUT_THB = 24
+SHIP_RETURN_THB = 20
+COMMISSION_RATE = 0.10
+COST_FORMULA = (f"(฿{SHIP_OUT_THB} shipping out + ฿{SHIP_RETURN_THB} shipping back "
+                f"+ {COMMISSION_RATE:.0%} of the order value in lost commission) × predicted risk")
+
+
+def commission(order_value):
+    return COMMISSION_RATE * np.asarray(order_value, dtype=float)
+
+
+def cost_of_failure(order_value):
+    """Money lost if this order fails (THB), per order."""
+    return SHIP_OUT_THB + SHIP_RETURN_THB + commission(order_value)
 
 
 # ---------------------------------------------------------------------------
@@ -193,23 +224,26 @@ def top_reasons(model, feats_row, order_hour, k=3):
 
 
 # ---------------------------------------------------------------------------
-# Money (same model as cod_risk_demo/src/decide.py)
+# Money: expected values from the PREDICTED risk only (no actual outcomes)
 # ---------------------------------------------------------------------------
-def simulate(tier, ftype, dc, catch, friction):
-    """Expected money effect of asking Tier 1 and Tier 2 orders.
-    catch / friction: {1: rate, 2: rate}. Returns totals in THB for these orders."""
-    tier, ftype = np.asarray(tier), np.asarray(ftype)
-    caught = lost_good = asked = 0.0
-    for k in (1, 2):
+def simulate(tier, risk, order_value, dc, catch, friction):
+    """Expected money effect of applying each order's tier action.
+
+    tier: 0 = no action, 1-4 = that tier's action. risk: predicted failure chance.
+    order_value: THB per order (commission is COMMISSION_RATE of it).
+    catch / friction: {tier: rate}. dc needs caught_become_delivered, message_cost_thb.
+    Returns totals in THB for these orders.
+    """
+    tier, risk, comm = np.asarray(tier), np.asarray(risk, dtype=float), commission(order_value)
+    prevented = prevented_comm = lost_comm = messaged = 0.0
+    for k in TIERS:
         in_tier = tier == k
-        caught += ((ftype == "wont") & in_tier).sum() * catch[k]
-        lost_good += ((ftype == "none") & in_tier).sum() * friction[k]
-        asked += in_tier.sum()
-    shipping = caught * dc["cost_failed_delivery_thb"]
-    back = caught * dc["caught_become_delivered"] * dc["commission_per_order_thb"]
-    fric = lost_good * dc["commission_per_order_thb"]
-    msg = asked * dc["message_cost_thb"]
-    n = max(len(tier), 1)
-    return {"asked_share": asked / n, "failures_avoided": caught, "shipping_saved": shipping,
-            "commission_won_back": back, "commission_lost_friction": fric, "message_cost": msg,
-            "net": shipping + back - fric - msg}
+        prevented += risk[in_tier].sum() * catch[k]
+        prevented_comm += (risk[in_tier] * comm[in_tier]).sum() * catch[k]
+        lost_comm += ((1 - risk[in_tier]) * comm[in_tier]).sum() * friction[k]
+        messaged += in_tier.sum()
+    shipping = prevented * (SHIP_OUT_THB + SHIP_RETURN_THB)
+    back = prevented_comm * dc["caught_become_delivered"]
+    msg = messaged * dc["message_cost_thb"]
+    return {"failures_prevented": prevented, "shipping_saved": shipping, "commission_won_back": back,
+            "commission_lost_friction": lost_comm, "message_cost": msg, "net": shipping + back - lost_comm - msg}

@@ -54,6 +54,27 @@ def calibration(y, p, groups=10):
     return d.groupby("group").agg(orders=("y", "size"), predicted=("p", "mean"), actual=("y", "mean"))
 
 
+def gini(y, p):
+    """Gini score on a 0-100 scale (= (2 x AUC - 1) x 100): 0 = random ranking, 100 = perfect."""
+    return (2 * auc(y, p) - 1) * 100
+
+
+def calibration_error(y, p, groups=10):
+    """Average gap between predicted risk and actual failure rate over the 10 risk groups,
+    weighted by orders, in percentage points (0 = predicted matches actual exactly)."""
+    c = calibration(y, p, groups)
+    return float((np.abs(c["predicted"] - c["actual"]) * c["orders"]).sum() / c["orders"].sum() * 100)
+
+
+# Bands for the overall scorecard: (upper limit, name). Gini uses the usual credit-scoring bands.
+GINI_BANDS = [(30, "Weak"), (50, "Fair"), (70, "Good"), (100, "Strong")]
+CALIBRATION_BANDS = [(0.5, "Good"), (1.0, "Fair"), (float("inf"), "Weak")]
+
+
+def band(value, bands):
+    return next(name for limit, name in bands if value < limit or limit == bands[-1][0])
+
+
 def summary(d):
     """The headline numbers for one set of orders (needs columns label_failed and risk)."""
     y, p = d["label_failed"].to_numpy(), d["risk"].to_numpy()
@@ -64,6 +85,8 @@ def summary(d):
         "Failures": int(y.sum()),
         "Actual failure rate": base,
         "Mean predicted risk": p.mean(),
+        "Gini score (0-100)": gini(y, p),
+        "Calibration error (pts)": calibration_error(y, p),
         "AUC": auc(y, p),
         "Brier score": float(np.mean((p - y) ** 2)),
         "Brier score, always predicting the average": float(np.mean((base - y) ** 2)),

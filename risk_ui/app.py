@@ -6,8 +6,6 @@ Pages:
   Dashboard         - KPIs, risk distribution, tiers, risk trend (daily / weekly / monthly)
   Orders            - every order (filterable, sortable) + full detail of one order
   Score an order    - type raw order / buyer data, get the risk score, tier and reasons
-  Policy simulator  - move the tier cut-offs and assumptions, see the money change
-  Model performance - predicted risk vs actual outcomes, train vs test, LR vs LightGBM
   Import data       - upload a CSV / Excel file of orders, check it in a pop-up, score it;
                       every page can then show the imported orders instead of the demo data
 
@@ -26,10 +24,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from risk_ui import importer
-from risk_ui import performance as pf
-from risk_ui.model import (DEPOSIT_SHARE, NICE_NAMES, SIM_DEFAULTS, TIER_ACTIONS, TIER_COLORS, TIER_CUTOFFS,
+from risk_ui.model import (DEPOSIT_SHARE, NICE_NAMES, TIER_ACTIONS, TIER_COLORS, TIER_CUTOFFS,
                            TIER_NAMES, TIER_RANGES, TIER_TEXT_ON, TIERS, COST_FORMULA, Model, assign_tiers, cost_of_failure,
-                           features_from_inputs, simulate, top_reasons)
+                           features_from_inputs, top_reasons)
 
 APP_DATA = Path(__file__).resolve().parent.parent / "cod_risk_demo" / "app_data"
 DEMO_NOTE = "Synthetic data, for illustration only. Not Shopee data."
@@ -41,7 +38,7 @@ def note():
     if st.session_state.get("active_source") == IMPORTED and imp:
         return f"Imported data ({imp['name']}), scored by a model trained on synthetic data."
     return DEMO_NOTE
-PAGES = ["Dashboard", "Orders", "Score an order", "Policy simulator", "Model performance", "Import data"]
+PAGES = ["Dashboard", "Orders", "Score an order", "Import data"]
 DEMO, IMPORTED = "Demo data", "Imported file"
 TIER_COLOR_BY_NAME = {TIER_NAMES[k]: v for k, v in TIER_COLORS.items()}
 # Theme colours (black / orange / white; the rest of the theme is in .streamlit/config.toml).
@@ -97,8 +94,7 @@ def baht(x):
 
 # ---------------------------------------------------------------------------
 # Filters. Two independent sets, each with its own key prefix so it can be reset:
-#   "fd_" = the Dashboard's row of filters, "f_" = the Orders page panel
-#   (the Policy simulator can reuse the Orders page result).
+#   "fd_" = the Dashboard's row of filters, "f_" = the Orders page panel.
 # A filter spec is (column, kind, label); kinds: date, multi, bool, range, ids, id.
 # ---------------------------------------------------------------------------
 DASHBOARD_FILTERS = [("order_datetime", "date", "Order date"), ("tier", "multi", "Tier"),
@@ -730,353 +726,6 @@ def page_score(all_orders, params, model):
 
 
 # ---------------------------------------------------------------------------
-# Page: Policy simulator
-# ---------------------------------------------------------------------------
-def sim_defaults(dc):
-    out = {f"sim_cut{k}": round(TIER_CUTOFFS[k] * 100, 4) for k in (2, 3, 4)}
-    for k in TIERS:
-        out[f"sim_catch{k}"] = round(SIM_DEFAULTS["catch"][k] * 100, 4)
-        out[f"sim_fric{k}"] = round(SIM_DEFAULTS["friction"][k] * 100, 4)
-    out.update({"sim_deliv": round(dc["caught_become_delivered"] * 100, 4), "sim_msg": dc["message_cost_thb"]})
-    return out
-
-
-def page_simulator(all_orders, params):
-    st.title("COD Risk Score · Policy simulator")
-    st.caption(note() + " Move the cut-offs and assumptions; every number is recomputed from the model's predicted risk. "
-               "Catch rates and friction are assumptions, not measurements. "
-               f"A failed order costs {COST_FORMULA.replace(' × predicted risk', '')}.")
-    dc = params["decision"]
-    for k, v in sim_defaults(dc).items():
-        st.session_state.setdefault(k, v)
-
-    has_test = bool((all_orders["split"] == "test").any())
-    first = "July test set" if has_test else "All imported orders"
-    scope = st.radio("Orders to simulate on", [first, "Orders matching the Orders-page filters"],
-                     horizontal=True, key="sim_scope_" + ("demo" if has_test else "imported"))
-    if scope == first:
-        d = all_orders[all_orders["split"] == "test"] if has_test else all_orders
-    else:
-        d, texts = apply_filters(all_orders, ORDERS_ALL_FILTERS, "f_")
-        st.caption(f"{len(d):,} orders · " + ("; ".join(texts) if texts else "no filters set on the Orders page"))
-    if d.empty:
-        st.warning("No orders to simulate.")
-        return
-
-    st.markdown("##### Tier cut-offs (predicted risk %)")
-    c = st.columns(3)
-    c[0].slider("Tier 2 starts at", 0.5, 10.0, step=0.1, key="sim_cut2")
-    c[1].slider("Tier 3 starts at", 2.0, 50.0, step=0.5, key="sim_cut3")
-    c[2].slider("Tier 4 starts at", 20.0, 99.0, step=1.0, key="sim_cut4")
-
-    st.markdown("##### What each tier's action does")
-    c = st.columns(4)
-    for col, k in zip(c, TIERS):
-        with col:
-            st.markdown(f"**{TIER_NAMES[k]}**  \n<span style='opacity:.65;font-size:13px'>{TIER_ACTIONS[k]}</span>",
-                        unsafe_allow_html=True)
-            st.slider("Failures prevented (%)", 0.0, 100.0, step=5.0, key=f"sim_catch{k}")
-            st.slider("Good orders lost (%)", 0.0, 30.0, step=0.5, key=f"sim_fric{k}")
-    c = st.columns(3)
-    c[0].slider("Prevented orders that end up delivered (%)", 0.0, 100.0, step=5.0, key="sim_deliv",
-                help="The rest are cancelled before shipping: no shipping cost, but no commission either.")
-    c[1].slider("Message cost per order (฿)", 0.0, 1.0, step=0.05, key="sim_msg",
-                help="Every tier sends at least one message (reminder, confirmation, deposit or payment request).")
-    if c[2].button("Back to the default assumptions"):
-        st.session_state.update(sim_defaults(dc))
-        st.rerun()
-
-    s = st.session_state
-    if not s.sim_cut2 < s.sim_cut3 < s.sim_cut4:
-        st.error("The cut-offs must go up: Tier 2 < Tier 3 < Tier 4.")
-        return
-    cuts = {k: s[f"sim_cut{k}"] / 100 for k in (2, 3, 4)}
-    catch = {k: s[f"sim_catch{k}"] / 100 for k in TIERS}
-    fric = {k: s[f"sim_fric{k}"] / 100 for k in TIERS}
-    dcx = {**dc, "caught_become_delivered": s.sim_deliv / 100, "message_cost_thb": s.sim_msg}
-
-    risk = d["risk"].to_numpy()
-    tier = assign_tiers(risk, cuts)
-    n = len(d)
-    yearly = dc["yearly_orders_total"] * dc["cod_share"]
-    per_year = lambda x: x / n * yearly  # noqa: E731
-    value = d["order_value"].to_numpy()
-    pol = {"Do nothing": simulate(np.zeros(n, int), risk, value, dcx, catch, fric),
-           "Confirm everyone (Tier 2 action)": simulate(np.full(n, 2), risk, value, dcx, catch, fric),
-           "Our tiers": simulate(tier, risk, value, dcx, catch, fric)}
-    cost_lost = (risk * cost_of_failure(value)).sum()
-
-    k = st.columns(4)
-    k[0].metric("Predicted cost lost / year (no action)", baht(per_year(cost_lost)), border=True)
-    k[1].metric("Net saving / year: our tiers", baht(per_year(pol["Our tiers"]["net"])), border=True)
-    k[2].metric("Net saving / year: confirm everyone", baht(per_year(pol["Confirm everyone (Tier 2 action)"]["net"])),
-                border=True)
-    diff = per_year(pol["Our tiers"]["net"] - pol["Confirm everyone (Tier 2 action)"]["net"])
-    k[3].metric("Our tiers vs confirm everyone", f"{'+' if diff >= 0 else '-'}{baht(abs(diff))} / year", border=True)
-
-    left, right = st.columns([1, 1.3])
-    with left:
-        st.markdown("##### Tier shape")
-        st.dataframe(pd.DataFrame({
-            "Tier": [TIER_NAMES[t] for t in TIERS],
-            "Share of orders": [pct((tier == t).mean()) for t in TIERS],
-            "Share of predicted failures": [pct(risk[tier == t].sum() / risk.sum()) for t in TIERS],
-            "Mean predicted risk": [pct(risk[tier == t].mean(), 2) if (tier == t).any() else "-" for t in TIERS]}),
-            hide_index=True, width="stretch")
-        st.markdown("##### Three policies (per 1,000 orders, ฿)")
-        st.dataframe(pd.DataFrame([{
-            "Policy": name, "Net per year (฿M)": round(per_year(r["net"]) / 1e6, 1), "Net": round(r["net"] / n * 1000, 1),
-            "Failures prevented": round(r["failures_prevented"] / n * 1000, 2),
-            "Shipping saved": round(r["shipping_saved"] / n * 1000, 1),
-            "Commission won back": round(r["commission_won_back"] / n * 1000, 1),
-            "Lost to friction": -round(r["commission_lost_friction"] / n * 1000, 1) + 0.0,
-            "Messages": -round(r["message_cost"] / n * 1000, 1) + 0.0} for name, r in pol.items()]),
-            hide_index=True, width="stretch")
-    with right:
-        grid = np.round(np.arange(0.5, min(s.sim_cut3, 10.0) + 0.001, 0.25), 2)
-        nets = [per_year(simulate(assign_tiers(risk, {**cuts, 2: g / 100}), risk, value, dcx, catch, fric)["net"]) / 1e6
-                for g in grid]
-        fig = go.Figure(go.Scatter(x=grid, y=nets, mode="lines", line=dict(width=2, color=ACCENT), name="Our tiers"))
-        fig.add_hline(y=per_year(pol["Confirm everyone (Tier 2 action)"]["net"]) / 1e6, line_dash="dash",
-                      line_color="#999", annotation_text="Confirm everyone")
-        fig.add_vline(x=s.sim_cut2, line_dash="dot", annotation_text=f"current {s.sim_cut2:.1f}%")
-        best = grid[int(np.argmax(nets))]
-        fig.update_layout(title=f"Net saving per year vs Tier 2 cut-off (best here: {best:.2f}%)",
-                          xaxis_title="Tier 2 cut-off (risk %)", yaxis_title="฿ million per year")
-        show(fig)
-
-    st.markdown("##### Sensitivity: net saving per year (฿M) for our tiers, by Tier 2 assumptions")
-    rows = []
-    for cr in (15, 25, 35):
-        row = {"Tier 2 failures prevented": f"{cr}%"}
-        for fr in (0.3, 0.5, 1.0):
-            c2, f2 = {**catch, 2: cr / 100}, {**fric, 2: fr / 100}
-            r = simulate(tier, risk, value, dcx, c2, f2)
-            e = simulate(np.full(n, 2), risk, value, dcx, c2, f2)
-            row[f"Tier 2 good orders lost {fr}%"] = f"{per_year(r['net']) / 1e6:,.1f} (vs {per_year(e['net']) / 1e6:,.1f})"
-        rows.append(row)
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("Each cell: our tiers (vs confirm everyone). Other tiers keep the values above. Yearly scale: "
-               f"{dc['yearly_orders_total'] / 1e6:,.1f}M orders x {dc['cod_share']:.0%} COD = {yearly / 1e6:,.1f}M COD orders.")
-
-
-# ---------------------------------------------------------------------------
-# Page: Model performance (predicted risk vs what actually happened)
-# ---------------------------------------------------------------------------
-SPLIT_COLORS = {"Test": ACCENT, "Train": CONTEXT}
-
-
-def table_height(rows):
-    """Height that shows every row of a dataframe without empty space (header + rows)."""
-    return 38 + 35 * rows
-
-
-def what_is_compared(text):
-    """A small note under each section saying exactly which data is compared."""
-    st.caption("ℹ️ " + text)
-
-
-def page_performance(demo):
-    st.title("COD Risk Score · Model performance")
-    st.caption(DEMO_NOTE + " How well the model's predicted risk matches what actually happened to each order.")
-    if st.session_state.get("active_source") == IMPORTED:
-        st.info("Imported files have no actual outcomes, so this page always uses the demo data.", icon="ℹ️")
-
-    with st.container(border=True):
-        st.markdown("**What this page compares**")
-        st.markdown(
-            "- **Predicted** = the model's risk score: the calibrated Logistic Regression used everywhere in this app.\n"
-            "- **Actual** = whether the order really failed in the synthetic data (refused, not home / no cash, or a "
-            "courier problem). The model never sees this when it scores an order.\n"
-            "- **Train** = Feb–Jun 2026 orders the model learned from (the first 80% to fit it, the last 20% to "
-            "choose settings and calibrate). **Test** = Jul 2026 orders it never saw: the honest numbers.\n"
-            "- If Test is about as good as Train, the model has not just memorised its training data.")
-
-    splits = {"Train": demo[demo["split"] == "train"], "Test": demo[demo["split"] == "test"]}
-    sm = {k: pf.summary(v) for k, v in splits.items()}
-
-    # ---- headline numbers: Test, with the change from Train ----
-    st.markdown("#### Headline numbers")
-    cards = [("AUC", "AUC", lambda v: f"{v:.3f}", "How well risk ranks failures above deliveries. 0.5 = random, 1 = perfect."),
-             ("Top 30% capture", "Top 30% capture", pct, "Share of all failures found when the 30% riskiest orders are asked."),
-             ("Top 5% capture", "Top 5% capture", pct, "Share of all failures found in the 5% riskiest orders."),
-             ("Brier score", "Brier score", lambda v: f"{v:.4f}", "Mean squared gap between predicted risk and the 0/1 outcome. Lower is better."),
-             ("Actual failure rate", None, None, "Share of test orders that really failed vs the model's average predicted risk.")]
-    cols = st.columns(len(cards))
-    for col, (label, key, fmt, helptext) in zip(cols, cards):
-        if key is None:
-            col.metric(f"{label} (test)", pct(sm["Test"]["Actual failure rate"], 2),
-                       f"predicted {pct(sm['Test']['Mean predicted risk'], 2)}",
-                       delta_color="off", delta_arrow="off", border=True, help=helptext, height="stretch")
-            continue
-        t, r = sm["Test"][key], sm["Train"][key]
-        gap = f"{abs(t - r) * 100:.1f} pts" if fmt is pct else fmt(abs(t - r))  # % metrics: percentage points
-        col.metric(f"{label} (test)", fmt(t), f"{'+' if t - r >= 0 else '-'}{gap} vs train ({fmt(r)})",
-                   delta_color="inverse" if key == "Brier score" else "normal", border=True, help=helptext, height="stretch")
-    what_is_compared("Big numbers = Test (Jul 2026, never seen in training). The small line = the change from Train "
-                     "(Feb–Jun 2026). Actual = real outcome in the synthetic data; predicted = model risk.")
-
-    left, right = st.columns([1.15, 1], gap="large")
-    with left:
-        st.markdown("##### Train vs test, all numbers")
-        rows = []
-        for name in sm["Test"]:
-            fmt = (lambda v: f"{v:,}") if name in ("Orders", "Failures") else \
-                (lambda v: f"{v:.3f}") if name == "AUC" else (lambda v: f"{v:.4f}") if "Brier" in name else \
-                (lambda v: f"{v:.1f}x") if "x average" in name else (lambda v: pct(v, 2))
-            rows.append({"Metric": name, "Train (Feb–Jun)": fmt(sm["Train"][name]), "Test (Jul)": fmt(sm["Test"][name])})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=table_height(len(rows)),
-                     column_config={"Metric": st.column_config.TextColumn(width="large")})
-    with right:
-        st.markdown("##### Actual vs predicted, by tier")
-        trows = []
-        for name, d in splits.items():
-            g = d.groupby("tier").agg(orders=("order_id", "size"), actual=("label_failed", "mean"),
-                                      predicted=("risk", "mean"), fails=("label_failed", "sum")).reindex(TIERS)
-            for k in TIERS:
-                if pd.isna(g.loc[k, "orders"]):
-                    continue
-                trows.append({"Data": name, "Tier": TIER_NAMES[k], "Orders": f"{int(g.loc[k, 'orders']):,}",
-                              "Actual rate": pct(g.loc[k, "actual"], 2), "Predicted": pct(g.loc[k, "predicted"], 2),
-                              "Share of failures": pct(g.loc[k, "fails"] / max(d["label_failed"].sum(), 1))})
-        st.dataframe(pd.DataFrame(trows), hide_index=True, width="stretch", height=table_height(len(trows)))
-    what_is_compared("Each tier: the actual failure rate of its orders vs the average risk the model gave them, "
-                     "for Train and for Test. Close numbers = the % on screen can be trusted.")
-
-    # ---- accuracy charts ----
-    st.markdown("#### How accurate is the risk score?")
-    c1, c2, c3 = st.columns(3, gap="medium")
-    with c1:
-        fig = go.Figure()
-        top = 0
-        for name in ("Train", "Test"):
-            cal = pf.calibration(splits[name]["label_failed"], splits[name]["risk"])
-            top = max(top, cal["predicted"].max(), cal["actual"].max())
-            fig.add_scatter(x=cal["predicted"] * 100, y=cal["actual"] * 100, mode="lines+markers", name=name,
-                            line=dict(color=SPLIT_COLORS[name], width=2), marker=dict(size=8),
-                            customdata=cal["orders"], hovertemplate="predicted %{x:.2f}%<br>actual %{y:.2f}%<br>"
-                                                                    "%{customdata:,} orders<extra>" + name + "</extra>")
-        fig.add_scatter(x=[0, top * 110], y=[0, top * 110], mode="lines", name="Perfect",
-                        line=dict(color="#55555c", width=1, dash="dash"), hoverinfo="skip")
-        fig.update_layout(title="Calibration", xaxis_title="Predicted risk (%)", yaxis_title="Actual failure rate (%)",
-                          legend=dict(orientation="h", yanchor="top", y=-0.22, x=0))
-        show(fig, height=400, bottom=110, subtitle=DEMO_NOTE)
-        what_is_compared("Orders split into 10 equal groups by predicted risk; each dot = the group's average "
-                         "predicted risk vs its actual failure rate. On the dashed line = predicted % is right.")
-    with c2:
-        fig = go.Figure()
-        for name in ("Train", "Test"):
-            x, y = pf.capture_points(splits[name]["label_failed"], splits[name]["risk"])
-            fig.add_scatter(x=x * 100, y=y * 100, mode="lines", name=name, line=dict(color=SPLIT_COLORS[name], width=2),
-                            hovertemplate="ask top %{x:.0f}%<br>find %{y:.1f}% of failures<extra>" + name + "</extra>")
-        fig.add_scatter(x=[0, 100], y=[0, 100], mode="lines", name="Random", hoverinfo="skip",
-                        line=dict(color="#55555c", width=1, dash="dash"))
-        fig.add_vline(x=30, line_width=1, line_color="#55555c")
-        fig.update_layout(title="Capture curve", xaxis_title="% of orders asked (riskiest first)",
-                          yaxis_title="% of failures found", legend=dict(orientation="h", yanchor="top", y=-0.22, x=0))
-        show(fig, height=400, bottom=110, subtitle=DEMO_NOTE)
-        what_is_compared(f"Asking the riskiest orders first, how many actual failures are found. At 30%: "
-                         f"Test {pct(sm['Test']['Top 30% capture'])}, Train {pct(sm['Train']['Top 30% capture'])}.")
-    with c3:
-        fig = go.Figure()
-        for name in ("Train", "Test"):
-            x, y = pf.roc_points(splits[name]["label_failed"], splits[name]["risk"])
-            fig.add_scatter(x=x * 100, y=y * 100, mode="lines", name=f"{name} (AUC {sm[name]['AUC']:.3f})",
-                            line=dict(color=SPLIT_COLORS[name], width=2),
-                            hovertemplate="false alarms %{x:.1f}%<br>failures caught %{y:.1f}%<extra>" + name + "</extra>")
-        fig.add_scatter(x=[0, 100], y=[0, 100], mode="lines", name="Random", hoverinfo="skip",
-                        line=dict(color="#55555c", width=1, dash="dash"))
-        fig.update_layout(title="ROC curve", xaxis_title="% of delivered orders flagged",
-                          yaxis_title="% of failed orders flagged", legend=dict(orientation="h", yanchor="top", y=-0.22, x=0))
-        show(fig, height=400, bottom=110, subtitle=DEMO_NOTE)
-        what_is_compared("Every possible cut-off: share of actually failed orders flagged vs share of actually "
-                         "delivered orders flagged by mistake. The further above the dashed line, the better.")
-
-    # ---- over time and by group ----
-    st.markdown("#### Over time and by group")
-    w = demo.set_index("order_datetime").resample("W").agg({"label_failed": "mean", "risk": "mean", "order_id": "size"})
-    w = w[w["order_id"] > 0]
-    fig = go.Figure([
-        go.Scatter(x=w.index, y=w["label_failed"] * 100, name="Actual", mode="lines+markers",
-                   line=dict(color=CONTEXT, width=2), marker=dict(size=6),
-                   hovertemplate="%{x|%Y-%m-%d}<br>actual %{y:.2f}%<extra></extra>"),
-        go.Scatter(x=w.index, y=w["risk"] * 100, name="Predicted", mode="lines+markers",
-                   line=dict(color=ACCENT, width=2), marker=dict(size=6),
-                   hovertemplate="%{x|%Y-%m-%d}<br>predicted %{y:.2f}%<extra></extra>")])
-    test_start = splits["Test"]["order_datetime"].min()
-    fig.add_vrect(x0=test_start, x1=w.index.max() + pd.Timedelta(days=3), fillcolor=ACCENT, opacity=0.08, line_width=0,
-                  annotation_text="Test (Jul)", annotation_position="top left")
-    fig.update_layout(title="Failure rate per week: actual vs predicted", yaxis_title="Failure rate (%)", hovermode="x",
-                      legend=dict(orientation="h", yanchor="top", y=-0.15, x=0))
-    show(fig, height=380, bottom=90, subtitle=DEMO_NOTE)
-    what_is_compared("Every week from Feb to Jul 2026: actual failure rate vs the model's average predicted risk. "
-                     "The shaded part is the Test month. A gap that keeps growing would mean the model needs retraining.")
-
-    left, right = st.columns(2, gap="large")
-    with left:
-        st.markdown("##### New vs returning COD buyers")
-        rows = []
-        for name, d in splits.items():
-            for label, part in (("New (first COD order)", d[d["is_new_cod_buyer"] == 1]),
-                                ("Returning", d[d["is_new_cod_buyer"] == 0])):
-                y, p = part["label_failed"], part["risk"]
-                rows.append({"Data": name, "Buyers": label, "Orders": f"{len(part):,}",
-                             "Actual rate": pct(y.mean(), 2), "Predicted": pct(p.mean(), 2),
-                             "AUC": f"{pf.auc(y, p):.3f}", "Top 30% capture": pct(pf.capture_at(y.to_numpy(), p.to_numpy(), 0.3))})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-        what_is_compared("Each group ranked on its own. New buyers have no history at all, so the model can only "
-                         "use the order itself (value, time, other shops, area): lower AUC is expected.")
-    with right:
-        st.markdown("##### Which failures land in the riskiest 30%")
-        rows = []
-        for name, d in splits.items():
-            top = d["risk"] >= d["risk"].quantile(0.70)
-            for ft, label in pf.FAILURE_TYPES.items():
-                is_ft = d["failure_type"] == ft
-                rows.append({"Data": name, "Failure type": label, "Failures": int(is_ft.sum()),
-                             "caught": (top & is_ft).sum() / max(is_ft.sum(), 1) * 100})
-        ft = pd.DataFrame(rows)
-        fig = go.Figure([go.Bar(y=ft[ft["Data"] == name]["Failure type"], x=ft[ft["Data"] == name]["caught"],
-                                name=name, orientation="h", marker_color=SPLIT_COLORS[name],
-                                text=[f"{v:.0f}%" for v in ft[ft["Data"] == name]["caught"]], textposition="outside",
-                                customdata=ft[ft["Data"] == name]["Failures"],
-                                hovertemplate="%{y}<br>%{x:.1f}% of %{customdata:,} caught<extra>" + name + "</extra>")
-                         for name in ("Train", "Test")])
-        fig.update_layout(title="% of each failure type in the riskiest 30% of orders", barmode="group",
-                          xaxis=dict(title="% caught", range=[0, 100], ticksuffix="%"), yaxis=dict(title=None, autorange="reversed"),
-                          legend=dict(orientation="h", yanchor="top", y=-0.25, x=0))
-        show(fig, height=330, bottom=100, value_axis="x", subtitle=DEMO_NOTE)
-        what_is_compared("Refusals (won't) are what the tiers try to stop, so they should be caught most. Courier "
-                         "problems are not the buyer's fault and depend on the area, so a low share there is fine.")
-
-    # ---- why Logistic Regression, not LightGBM ----
-    st.markdown("#### Logistic Regression vs LightGBM")
-    trials, s, rec = pf.training_record()
-    left, right = st.columns([1.3, 1], gap="large")
-    with left:
-        fig = go.Figure(go.Bar(
-            y=[f"{m} · {st_}" for m, st_ in zip(trials["Model"], trials["Setting"])], x=trials["Validation AUC"],
-            orientation="h", marker_color=[ACCENT if m.startswith("Logistic") else CONTEXT for m in trials["Model"]],
-            text=[f"{v:.4f}" for v in trials["Validation AUC"]], textposition="outside",
-            hovertemplate="%{y}<br>validation AUC %{x:.4f}<extra></extra>"))
-        lo = trials["Validation AUC"].min()
-        fig.update_layout(title="Validation AUC during training", xaxis=dict(title="AUC", range=[lo - 0.02, trials["Validation AUC"].max() + 0.02]),
-                          yaxis=dict(title=None, autorange="reversed"), showlegend=False)
-        show(fig, height=330, value_axis="x", subtitle=DEMO_NOTE)
-        what_is_compared(f"Validation = the last 20% of the training period ({s['valid_rows']:,} orders from "
-                         f"{s['valid_from'][:10]}), used to pick LightGBM's settings. Test data was not used here.")
-    with right:
-        st.success(f"**Used in the app: {rec['name']}.** {rec['reason']}")
-    table = pf.report_test_table()
-    if table is not None:
-        st.markdown("##### Both models on the test set")
-        st.dataframe(table, hide_index=True, width="stretch", height=table_height(len(table)),
-                     column_config={"Metric (test set)": st.column_config.TextColumn(width="large")})
-        what_is_compared("Both models on the Test set (Jul 2026), from the training pipeline's report "
-                         "(cod_risk_demo/reports/model_report.md).")
-
-
-# ---------------------------------------------------------------------------
 # Page: Import data (+ the check pop-up)
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner="Reading and checking the file ...", max_entries=3)
@@ -1280,7 +929,7 @@ def render():
         return
     # Keep filter / form values when switching pages (Streamlit drops state of hidden widgets).
     for k in list(st.session_state.keys()):
-        if k.startswith(("f_", "fd_", "in_", "sim_")) and not k.startswith("in_load_msg"):
+        if k.startswith(("f_", "fd_", "in_")) and not k.startswith("in_load_msg"):
             st.session_state[k] = st.session_state[k]
 
     params, demo = load()
@@ -1288,8 +937,8 @@ def render():
 
     st.sidebar.title("COD Risk Score")
     st.sidebar.caption("ML model (calibrated Logistic Regression), trained on synthetic data. Not Shopee data.")
-    # Direct links: ?page=dashboard|orders|score|simulator|performance|import
-    wanted = {"dashboard": 0, "orders": 1, "score": 2, "simulator": 3, "performance": 4, "import": 5}.get(st.query_params.get("page", ""), 0)
+    # Direct links: ?page=dashboard|orders|score|import
+    wanted = {"dashboard": 0, "orders": 1, "score": 2, "import": 3}.get(st.query_params.get("page", ""), 0)
     page = st.sidebar.radio("Page", PAGES, index=wanted, key="risk_page")
     df = data_source_picker(demo)
 
@@ -1299,10 +948,6 @@ def render():
         page_dashboard(df, params)
     elif page == "Orders":
         page_orders(df, params, model)
-    elif page == "Policy simulator":
-        page_simulator(df, params)
-    elif page == "Model performance":  # needs actual outcomes, so always the demo data
-        page_performance(demo)
     else:
         page_import(params, model, demo)
 

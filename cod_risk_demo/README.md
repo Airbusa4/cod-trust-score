@@ -70,16 +70,14 @@ pip install -r requirements.txt   # the root requirements (streamlit, plotly, ..
 streamlit run app.py
 ```
 
-Open http://localhost:8501 (add `?page=orders`, `?page=score` or `?page=simulator`
-to start on another page; `?page=performance` / `?page=import` open those pages). Pages:
+Open http://localhost:8501 (add `?page=orders`, `?page=score` or `?page=import`
+to start on another page). Pages:
 
 | Page | What it does |
 | --- | --- |
 | Dashboard | Orders, mean predicted risk and predicted cost lost ((฿24 shipping out + ฿20 shipping back + 10% of the order value) x risk), risk distribution with cut-offs, tier table, predicted-risk trend (daily / weekly / monthly) |
 | Orders | All 76,232 orders (sortable, downloadable). Click a row: score, tier, top 3 reasons, every factor's push, phone mockup |
 | Score an order | Start from an example (typical buyer, new buyer, past refuser) or load any order, then edit the fields (each has a short description); the app builds the 20 features and scores live |
-| Policy simulator | Move the 3 tier cut-offs and each tier's assumed "failures prevented" and "good orders lost"; see tier shape, three policies, net saving vs Tier 2 cut-off and a sensitivity table |
-| Model performance | Predicted risk vs actual outcomes (synthetic data), Train (Feb-Jun) vs Test (Jul): AUC, Brier, top 30% / 5% capture, actual vs predicted by tier, calibration, capture and ROC curves, weekly actual vs predicted, new vs returning buyers, failure types caught, and Logistic Regression vs LightGBM. Each section says which data it compares. Always uses the demo data (imported files have no outcomes) |
 | Import data | Download the template (Excel or CSV, 100 example rows), upload your own orders (.csv / .xlsx). A pop-up checks the file (column completeness, every check, the problem rows with reasons) and lets you import the rows that pass. The orders are scored with the same model; pick **Data → Imported file** in the sidebar to see them on every page |
 
 The app shows only the model's predictions; actual outcomes are kept out of the UI.
@@ -93,12 +91,10 @@ App tiers (set in `risk_ui/model.py`, not in `config.yaml`):
 | 3 | 10% to 77% | Refundable Deposit 10% |
 | 4 | 77% and above | COD → Prepaid Requirement |
 
-The simulator's default catch / friction values per tier are assumptions (`SIM_DEFAULTS` in `risk_ui/model.py`).
 The pipeline reports (`reports/decision_report.md`) still use the older 3-tier policy in `config.yaml` (`decision:`).
 
 Filters: the Dashboard has its own row (date, tier, area, split). The Orders page has the full panel
-(order / buyer ID, date, tier, plus "More filters" tabs for order, buyer, area and score); the Policy simulator
-can run on the orders that match it. The two sets are independent and are kept when you switch pages.
+(order / buyer ID, date, tier, plus "More filters" tabs for order, buyer, area and score). The two sets are independent and are kept when you switch pages.
 
 The app does not load the joblib models (both projects have a package called `src`); it uses the exported
 numbers, and `src/export_app.py` proves they give the same scores.
